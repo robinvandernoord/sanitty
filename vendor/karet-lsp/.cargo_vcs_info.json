@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "5cf59e6e61840c88b8bb6bd0acde7031df97a21e"
+  },
+  "path_in_vcs": "crates/karet-lsp"
+}
