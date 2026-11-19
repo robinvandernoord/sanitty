@@ -1,0 +1,298 @@
+//! sanitty: a PyCharm-flavoured terminal IDE built on the karet-* crates.
+
+mod allkeys;
+mod app;
+mod colors;
+mod csv;
+mod doc;
+mod explorer;
+mod find;
+mod keycheck;
+mod keymap;
+mod lsp;
+mod markdown;
+mod picker;
+mod search;
+mod sig;
+mod stylenav;
+mod tshl;
+mod ui;
+
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use crossterm::event;
+use crossterm::event::DisableBracketedPaste;
+use crossterm::event::EnableBracketedPaste;
+use crossterm::event::KeyboardEnhancementFlags;
+use crossterm::event::PopKeyboardEnhancementFlags;
+use crossterm::event::PushKeyboardEnhancementFlags;
+use crossterm::execute;
+use crossterm::terminal;
+use karet_core::Diagnostic;
+use karet_core::Location;
+use karet_lsp::LspClient;
+use tokio::sync::mpsc;
+
+/// Everything the app loop reacts to.
+pub enum Event {
+    Term(event::Event),
+    Files(Vec<PathBuf>),
+    Status(String),
+    LspReady(&'static str, Arc<LspClient>),
+    LspFailed(&'static str, String),
+    Diagnostics(PathBuf, Vec<Diagnostic>),
+    Locations(lsp::Nav, Vec<Location>),
+    Rename(lsp::Edit),
+    /// A hover answer: file, caret position (chars), text, and whether it was
+    /// asked for as a popup (Alt+H) rather than for the status line.
+    Hover(PathBuf, karet_core::LineCol, Option<String>, bool),
+    /// Semantic tokens for a file at an LSP document version (UTF-16 columns).
+    Semantic(PathBuf, i32, Vec<karet_core::SemanticToken>),
+    /// Async launcher results: search generation, kind, items.
+    Launcher(u64, picker::Kind, Vec<picker::Item>),
+    Tick,
+}
+
+/// Append a line to the file named by `SANITTY_LOG`, if set. For tracing
+/// language-server trouble without disturbing the screen.
+pub fn debug_log(line: &str) {
+    if let Some(path) = std::env::var_os("SANITTY_LOG")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// `$XDG_CONFIG_HOME/sanitty`.
+pub fn config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("sanitty"))
+}
+
+/// Copy to the system clipboard through the terminal (OSC 52), which works over
+/// SSH in Ghostty without any clipboard daemon on the remote side.
+pub fn osc52_copy(text: &str) {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(B64[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{out}\x07");
+    let _ = stdout.flush();
+}
+
+/// The workspace root for a path: the enclosing git repository, else the
+/// directory itself.
+fn workspace_root(path: &Path) -> PathBuf {
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+    };
+    let dir = dir.to_path_buf();
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    dir.ancestors()
+        .find(|a| a.join(".git").exists())
+        .map_or(dir.clone(), Path::to_path_buf)
+}
+
+/// Directories never worth listing or searching, even without a `.gitignore`:
+/// VCS data, build output, dependency trees and tool caches.
+pub const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".idea",
+];
+
+fn index_files(root: PathBuf, tx: mpsc::UnboundedSender<Event>) {
+    std::thread::spawn(move || {
+        let files: Vec<PathBuf> = ignore::WalkBuilder::new(&root)
+            .hidden(false)
+            .filter_entry(|e| {
+                !(e.file_type().is_some_and(|t| t.is_dir())
+                    && SKIP_DIRS.iter().any(|d| e.file_name() == *d))
+            })
+            .build()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+            .map(ignore::DirEntry::into_path)
+            .take(200_000)
+            .collect();
+        let _ = tx.send(Event::Files(files));
+    });
+}
+
+/// Reads terminal input on its own thread. `paused` stops it while a child
+/// shell owns the terminal, so no keystrokes are stolen from it.
+fn spawn_input(tx: mpsc::UnboundedSender<Event>, paused: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        loop {
+            if paused.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            match event::poll(Duration::from_millis(30)) {
+                Ok(true) => {
+                    if let Ok(ev) = event::read()
+                        && tx.send(Event::Term(ev)).is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+fn enter_terminal(enhanced: bool) -> std::io::Result<()> {
+    terminal::enable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        terminal::EnterAlternateScreen,
+        EnableBracketedPaste
+    )?;
+    if enhanced {
+        execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    Ok(())
+}
+
+fn leave_terminal(enhanced: bool) {
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+    let _ = terminal::disable_raw_mode();
+}
+
+/// Hand the terminal to `$SHELL` in the workspace root until it exits.
+fn run_shell(root: &Path, enhanced: bool, paused: &AtomicBool) {
+    paused.store(true, Ordering::Release);
+    std::thread::sleep(Duration::from_millis(60));
+    leave_terminal(enhanced);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    println!("sanitty: {shell} in {} (exit to return)", root.display());
+    let _ = std::process::Command::new(shell)
+        .current_dir(root)
+        .env("SANITTY", "1")
+        .status();
+    let _ = enter_terminal(enhanced);
+    paused.store(false, Ordering::Release);
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // `--check-keys` starts in Check Keys, for terminals that swallow Ctrl+K.
+    let check_keys = std::env::args().any(|a| a == "--check-keys");
+    let arg = std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with("--"))
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let root = workspace_root(&arg);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let paused = Arc::new(AtomicBool::new(false));
+
+    enter_terminal(false)?;
+    let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        leave_terminal(enhanced);
+        hook(info);
+    }));
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+    term.clear()?;
+
+    let mut app = app::App::new(root.clone(), tx.clone());
+    app.enhanced_keys = enhanced;
+    if check_keys {
+        app.check_keys();
+    } else if arg.is_file() {
+        app.open(&arg, None);
+    } else {
+        app.show_tree();
+    }
+    index_files(root.clone(), tx.clone());
+    spawn_input(tx.clone(), paused.clone());
+    let tick_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(Duration::from_millis(300));
+        loop {
+            iv.tick().await;
+            if tick_tx.send(Event::Tick).is_err() {
+                break;
+            }
+        }
+    });
+
+    let result: anyhow::Result<()> = async {
+        loop {
+            term.draw(|f| app.render(f))?;
+            let Some(ev) = rx.recv().await else { break };
+            app.handle(ev);
+            // Drain whatever else is queued before redrawing (fast typing, pastes).
+            while let Ok(ev) = rx.try_recv() {
+                app.handle(ev);
+            }
+            if app.shell_requested {
+                app.shell_requested = false;
+                run_shell(&app.root, enhanced, &paused);
+                term.clear()?;
+            }
+            if app.quit {
+                break;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    leave_terminal(enhanced);
+    result
+}

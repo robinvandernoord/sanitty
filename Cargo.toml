@@ -1,0 +1,43 @@
+[package]
+name = "sanitty"
+version = "0.1.0"
+edition = "2024"
+description = "A PyCharm-flavoured terminal IDE built on the karet-* crates"
+license = "MIT"
+
+[[bin]]
+name = "sanitty"
+path = "src/main.rs"
+
+[dependencies]
+karet-core = "0.8.0"
+karet-text = "0.8.0"
+karet-editor = "0.8.0"
+karet-theme = { version = "0.8.0", features = ["view"] }
+karet-syntax = { version = "0.8.0", features = [
+    "lang-python", "lang-rust", "lang-typescript", "lang-javascript", "lang-json",
+    "lang-toml", "lang-yaml", "lang-markdown", "lang-sql", "lang-html", "lang-css",
+    "lang-bash", "lang-containerfile", "lang-scss", "lang-sass", "lang-less",
+] }
+karet-lsp = "0.8.0"
+karet-search = "0.8.0"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
+ignore = "0.4"
+nucleo-matcher = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The same versions karet-treesitter builds, used directly for TypeScript
+# highlighting with the JavaScript and TypeScript queries combined.
+tree-sitter = "0.26.13"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+streaming-iterator = "0.1.9"
+toml = "0.9"
+anyhow = "1"
+dirs = "6"
+
+# karet-lsp 0.8.0 with two fixes (see vendor/karet-lsp/SANITTY-PATCH.md).
+[patch.crates-io]
+karet-lsp = { path = "vendor/karet-lsp" }
