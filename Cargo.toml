@@ -41,3 +41,15 @@ dirs = "6"
 # karet-lsp 0.8.0 with two fixes (see vendor/karet-lsp/SANITTY-PATCH.md).
 [patch.crates-io]
 karet-lsp = { path = "vendor/karet-lsp" }
+
+[lints.clippy]
+# Hard rules: no panicking shortcuts in the IDE.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Identifiers must be at least 3 characters (see clippy.toml for the allowlist).
+min_ident_chars = "warn"
+indexing_slicing = "warn"
+pedantic = { level = "warn", priority = -1 }

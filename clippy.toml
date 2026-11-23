@@ -1,0 +1,5 @@
+# `min_ident_chars` flags names whose length is at or below this threshold,
+# so 2 means "identifiers must be at least 3 characters".
+min-ident-chars-threshold = 2
+# Conventional short names that stay allowed (replaces clippy's default list).
+allowed-idents-below-min-chars = ["x", "y", "id", "tx", "rx"]

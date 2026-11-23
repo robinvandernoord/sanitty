@@ -1,6 +1,6 @@
 //! The project tree popup (Alt+1): a left-hand panel that only exists while open.
 //!
-//! Typing searches the visible entries, as PyCharm's speed search does: the
+//! Typing searches the visible entries, as `PyCharm`'s speed search does: the
 //! selection jumps to the best match, Up/Down step between matches, and
 //! expanding a folder (Right or Enter) starts a fresh search inside it. So
 //! `py4` Right `ap` Right `adm` walks to `py4web/apps/_admin`.
@@ -51,28 +51,28 @@ impl Explorer {
     pub fn new(root: &Path, reveal: Option<&Path>) -> Self {
         let mut expanded = HashSet::new();
         expanded.insert(root.to_path_buf());
-        let mut e = Self {
+        let mut explorer = Self {
             root: root.to_path_buf(),
             expanded,
             rows: Vec::new(),
             list: ListState::default(),
             query: String::new(),
         };
-        e.list.select(Some(0));
-        e.reveal(reveal);
-        e
+        explorer.list.select(Some(0));
+        explorer.reveal(reveal);
+        explorer
     }
 
     /// Re-read the tree (files may have changed since it was last open) and
     /// select `path`, expanding its folders; without one, keep the selection
     /// where it was, so reopening the tree finds it as it was left.
     pub fn reveal(&mut self, path: Option<&Path>) {
-        let keep = self.selected().map(|r| r.path.clone());
-        if let Some(mut p) = path.and_then(Path::parent) {
-            while p.starts_with(&self.root) {
-                self.expanded.insert(p.to_path_buf());
-                match p.parent() {
-                    Some(parent) => p = parent,
+        let keep = self.selected().map(|row| row.path.clone());
+        if let Some(mut folder) = path.and_then(Path::parent) {
+            while folder.starts_with(&self.root) {
+                self.expanded.insert(folder.to_path_buf());
+                match folder.parent() {
+                    Some(parent) => folder = parent,
                     None => break,
                 }
             }
@@ -81,7 +81,7 @@ impl Explorer {
         self.rebuild();
         let target = path.map(Path::to_path_buf).or(keep);
         let idx = target
-            .and_then(|t| self.rows.iter().position(|row| row.path == t))
+            .and_then(|wanted| self.rows.iter().position(|row| row.path == wanted))
             .unwrap_or(0);
         self.list.select(Some(idx));
     }
@@ -97,20 +97,22 @@ impl Explorer {
         let mut entries: Vec<(PathBuf, bool)> = ignore::WalkBuilder::new(dir)
             .max_depth(Some(1))
             .hidden(false)
-            .filter_entry(|e| e.file_name() != ".git")
+            .filter_entry(|entry| entry.file_name() != ".git")
             .build()
             .filter_map(Result::ok)
-            .filter(|e| e.depth() == 1)
-            .map(|e| {
+            .filter(|entry| entry.depth() == 1)
+            .map(|entry| {
                 (
-                    e.path().to_path_buf(),
-                    e.file_type().is_some_and(|t| t.is_dir()),
+                    entry.path().to_path_buf(),
+                    entry.file_type().is_some_and(|kind| kind.is_dir()),
                 )
             })
             .collect();
-        entries.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| a.0.file_name().cmp(&b.0.file_name()))
+        // Folders first, then by name.
+        entries.sort_by(|(left_path, left_dir), (right_path, right_dir)| {
+            right_dir
+                .cmp(left_dir)
+                .then_with(|| left_path.file_name().cmp(&right_path.file_name()))
         });
         for (path, is_dir) in entries {
             let open = is_dir && self.expanded.contains(&path);
@@ -126,7 +128,7 @@ impl Explorer {
     }
 
     fn selected(&self) -> Option<&Row> {
-        self.list.selected().and_then(|i| self.rows.get(i))
+        self.list.selected().and_then(|idx| self.rows.get(idx))
     }
 
     fn toggle(&mut self, expand: Option<bool>) {
@@ -149,7 +151,7 @@ impl Explorer {
                     self.expanded.insert(path.clone());
                 }
                 self.rebuild();
-                let idx = self.rows.iter().position(|r| r.path == path);
+                let idx = self.rows.iter().position(|row| row.path == path);
                 self.list.select(idx);
             }
         }
@@ -158,21 +160,20 @@ impl Explorer {
     fn name(row: &Row) -> String {
         row.path
             .file_name()
-            .map(|n| n.to_string_lossy().to_lowercase())
-            .unwrap_or_default()
+            .map_or_else(String::new, |name| name.to_string_lossy().to_lowercase())
     }
 
     /// How well a row matches the query: 3 prefix, 2 substring, 1 subsequence.
     fn tier(&self, row: &Row) -> u8 {
         let name = Self::name(row);
-        let q = self.query.to_lowercase();
-        if name.starts_with(&q) {
+        let query = self.query.to_lowercase();
+        if name.starts_with(&query) {
             3
-        } else if name.contains(&q) {
+        } else if name.contains(&query) {
             2
         } else {
             let mut chars = name.chars();
-            u8::from(q.chars().all(|c| chars.any(|n| n == c)))
+            u8::from(query.chars().all(|wanted| chars.any(|chr| chr == wanted)))
         }
     }
 
@@ -181,46 +182,55 @@ impl Explorer {
         if self.query.is_empty() {
             return;
         }
-        let best = self.rows.iter().map(|r| self.tier(r)).max().unwrap_or(0);
+        let best = self
+            .rows
+            .iter()
+            .map(|row| self.tier(row))
+            .max()
+            .unwrap_or(0);
         if best == 0 {
             return;
         }
         let start = self.list.selected().unwrap_or(0);
-        let n = self.rows.len();
-        if let Some(i) = (0..n)
-            .map(|k| (start + k) % n)
-            .find(|i| self.tier(&self.rows[*i]) == best)
+        let count = self.rows.len();
+        if let Some(idx) = (0..count)
+            .map(|offset| (start + offset) % count)
+            .find(|idx| {
+                self.rows
+                    .get(*idx)
+                    .is_some_and(|row| self.tier(row) == best)
+            })
         {
-            self.list.select(Some(i));
+            self.list.select(Some(idx));
         }
     }
 
     /// Up/Down while searching: the previous or next row that matches at all.
     fn step_match(&mut self, forward: bool) {
-        let n = self.rows.len();
+        let count = self.rows.len();
         let start = self.list.selected().unwrap_or(0);
-        let found = (1..n)
-            .map(|k| {
+        let found = (1..count)
+            .map(|offset| {
                 if forward {
-                    (start + k) % n
+                    (start + offset) % count
                 } else {
-                    (start + n - k) % n
+                    (start + count - offset) % count
                 }
             })
-            .find(|i| self.tier(&self.rows[*i]) > 0);
-        if let Some(i) = found {
-            self.list.select(Some(i));
+            .find(|idx| self.rows.get(*idx).is_some_and(|row| self.tier(row) > 0));
+        if let Some(idx) = found {
+            self.list.select(Some(idx));
         }
     }
 
     fn select_parent(&mut self) {
         let Some(parent) = self
             .selected()
-            .and_then(|r| r.path.parent().map(Path::to_path_buf))
+            .and_then(|row| row.path.parent().map(Path::to_path_buf))
         else {
             return;
         };
-        if let Some(idx) = self.rows.iter().position(|r| r.path == parent) {
+        if let Some(idx) = self.rows.iter().position(|row| row.path == parent) {
             self.list.select(Some(idx));
         }
     }
@@ -243,8 +253,8 @@ impl Explorer {
             }
             KeyCode::Up if searching => self.step_match(false),
             KeyCode::Down if searching => self.step_match(true),
-            KeyCode::Char(c) if plain && (c != ' ' || searching) => {
-                self.query.push(c);
+            KeyCode::Char(chr) if plain && (chr != ' ' || searching) => {
+                self.query.push(chr);
                 self.search();
             }
             KeyCode::Up => self.list.select_previous(),
@@ -268,32 +278,36 @@ impl Explorer {
         Outcome::Pending
     }
 
-    pub fn render(&mut self, f: &mut Frame, area: Rect, theme: &karet_theme::Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &karet_theme::Theme) {
         // Wide enough for the longest visible name, within 30 columns and
         // 60% of the screen.
         let longest = self
             .rows
             .iter()
-            .map(|r| {
-                r.depth * 2
+            .map(|row| {
+                row.depth * 2
                     + 2
-                    + r.path
+                    + row
+                        .path
                         .file_name()
-                        .map_or(0, |n| n.to_string_lossy().chars().count())
+                        .map_or(0, |name| name.to_string_lossy().chars().count())
             })
             .max()
-            .unwrap_or(0) as u16;
-        let w = (longest + 4).clamp(
-            30.min(area.width),
-            (area.width * 6 / 10).max(30.min(area.width)),
-        );
-        let rect = Rect { width: w, ..area };
-        f.render_widget(Clear, rect);
-        let bg = crate::ui::surface(theme);
+            .unwrap_or(0);
+        let width = u16::try_from(longest)
+            .unwrap_or(u16::MAX)
+            .saturating_add(4)
+            .clamp(
+                30.min(area.width),
+                (area.width * 6 / 10).max(30.min(area.width)),
+            );
+        let rect = Rect { width, ..area };
+        frame.render_widget(Clear, rect);
+        let surface = crate::styles::surface(theme);
         let muted = theme.style(karet_core::ThemeRole::Muted);
         let name = self.root.file_name().map_or_else(
             || self.root.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
+            |name| name.to_string_lossy().into_owned(),
         );
         let accent = theme
             .token_style(karet_core::TokenId::FUNCTION)
@@ -301,7 +315,7 @@ impl Explorer {
         let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
             .title(format!(" {name} "))
-            .style(bg);
+            .style(surface);
         if !self.query.is_empty() {
             block = block.title_bottom(Line::from(vec![
                 Span::raw(" search: "),
@@ -315,24 +329,23 @@ impl Explorer {
                 .unwrap_or(&row.path)
                 .display()
                 .to_string();
-            let max = (w as usize).saturating_sub(6);
+            let max = usize::from(width).saturating_sub(6);
             block = block.title_bottom(Line::styled(
                 format!(" {} ", crate::picker::keep_end(&rel, max)),
                 muted,
             ));
         }
-        let name_room = (w as usize).saturating_sub(2);
+        let name_room = usize::from(width).saturating_sub(2);
         let items: Vec<ListItem> = self
             .rows
             .iter()
-            .map(|r| {
-                let file = r
+            .map(|row| {
+                let file = row
                     .path
                     .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let marker = if r.is_dir {
-                    if self.expanded.contains(&r.path) {
+                    .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                let marker = if row.is_dir {
+                    if self.expanded.contains(&row.path) {
                         "v "
                     } else {
                         "> "
@@ -340,31 +353,85 @@ impl Explorer {
                 } else {
                     "  "
                 };
-                let mut style = if r.is_dir {
+                let mut style = if row.is_dir {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                if !self.query.is_empty() && self.tier(r) >= 2 {
+                if !self.query.is_empty() && self.tier(row) >= 2 {
                     style = style.patch(accent);
                 }
                 let file =
-                    crate::picker::keep_start(&file, name_room.saturating_sub(r.depth * 2 + 2));
+                    crate::picker::keep_start(&file, name_room.saturating_sub(row.depth * 2 + 2));
                 ListItem::new(Line::from(vec![
-                    Span::raw("  ".repeat(r.depth)),
+                    Span::raw("  ".repeat(row.depth)),
                     Span::styled(marker, muted),
                     Span::styled(file, style),
                 ]))
             })
             .collect();
-        let sel = Style::default().add_modifier(Modifier::REVERSED);
-        f.render_stateful_widget(
+        let selected = Style::default().add_modifier(Modifier::REVERSED);
+        frame.render_stateful_widget(
             List::new(items)
                 .block(block)
-                .highlight_style(sel)
+                .highlight_style(selected)
                 .scroll_padding(3),
             rect,
             &mut self.list,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyModifiers;
+
+    use super::*;
+
+    fn press(explorer: &mut Explorer, code: KeyCode) {
+        let _ = explorer.handle_key(&KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn typed(explorer: &mut Explorer, text: &str) {
+        for chr in text.chars() {
+            press(explorer, KeyCode::Char(chr));
+        }
+    }
+
+    fn selected_path(explorer: &Explorer) -> Result<PathBuf, &'static str> {
+        explorer
+            .selected()
+            .map(|row| row.path.clone())
+            .ok_or("nothing selected")
+    }
+
+    /// Speed search through nested folders: py4 Right ap Right adm.
+    #[test]
+    fn speed_search_walks_down_the_tree() -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("sanitty-tree-{}", std::process::id()));
+        for dir in [
+            "py4web/apps/admin",
+            "py4web/apps/_default",
+            "pyproject",
+            "docs",
+        ] {
+            std::fs::create_dir_all(root.join(dir))?;
+        }
+        std::fs::write(root.join("py4web/apps/admin/__init__.py"), "")?;
+        let mut explorer = Explorer::new(&root, None);
+
+        typed(&mut explorer, "py4");
+        assert_eq!(selected_path(&explorer)?, root.join("py4web"));
+        press(&mut explorer, KeyCode::Right);
+        typed(&mut explorer, "ap");
+        assert_eq!(selected_path(&explorer)?, root.join("py4web/apps"));
+        press(&mut explorer, KeyCode::Right);
+        typed(&mut explorer, "adm");
+        let found = selected_path(&explorer)?;
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, root.join("py4web/apps/admin"));
+        Ok(())
     }
 }

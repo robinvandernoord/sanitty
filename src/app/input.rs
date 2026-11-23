@@ -1,0 +1,528 @@
+//! Keys and pastes: routing them to the overlay, the find bar or the editor, and running actions.
+
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyModifiers;
+use karet_core::EditCause;
+use karet_core::LineCol;
+use karet_core::Range;
+use karet_editor::Motion;
+
+use crate::allkeys;
+use crate::allkeys::AllKeys;
+use crate::doc::Doc;
+use crate::explorer;
+use crate::find;
+use crate::find::Find;
+use crate::keycheck;
+use crate::keycheck::KeyCheck;
+use crate::keymap::Action;
+use crate::lsp::Nav;
+use crate::picker;
+use crate::picker::Item;
+use crate::picker::Kind;
+use crate::picker::Picker;
+use crate::picker::Target;
+
+use super::App;
+use super::Overlay;
+use super::file_name;
+use super::parent_dir;
+use super::save_keycheck;
+use super::visible;
+
+impl App {
+    pub(super) fn on_paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        match &mut self.overlay {
+            Overlay::Rename { text: name, .. } => name.push_str(text.lines().next().unwrap_or("")),
+            Overlay::Find(find) => {
+                if let Some(doc) = visible(&mut self.docs, self.active, self.home) {
+                    find.paste(&text, doc);
+                }
+            }
+            Overlay::None => {
+                if let Some(doc) = self.doc() {
+                    doc.type_text(&text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn on_key(&mut self, key: KeyEvent) {
+        // Overlays get the key first; an unhandled global action still works
+        // from inside them (Alt+1 closes the tree, Alt+N swaps pickers).
+        // The key check sees every key raw, Ctrl+C included.
+        if self.key_check_key(&key) {
+            return;
+        }
+        // A message lasts until the next key, so the problem under the caret
+        // shows again; a pending "press again" lasts exactly one key.
+        self.status.clear();
+        self.armed = self.confirm.take();
+        let action = self.keymap.lookup(&key);
+        if self.completion_key(&key, action) {
+            return;
+        }
+        // Ctrl+C in a popup backs out of it, as in any terminal program;
+        // the tree on the home screen is part of that screen, so there it quits.
+        if action == Some(Action::Copy) && !matches!(self.overlay, Overlay::None) {
+            if self.cur().is_none() && matches!(self.overlay, Overlay::Explorer(_)) {
+                self.run(Action::Quit);
+            } else {
+                self.close_overlay();
+            }
+            return;
+        }
+        if self.overlay_key(&key, action) {
+            return;
+        }
+        if let Some(action) = action {
+            self.run(action);
+            return;
+        }
+        self.edit_key(key);
+    }
+
+    /// The key check overlay, which sees every key raw. True if it was open.
+    fn key_check_key(&mut self, key: &KeyEvent) -> bool {
+        let Overlay::KeyCheck(check) = &mut self.overlay else {
+            return false;
+        };
+        match check.handle_key(key) {
+            keycheck::Outcome::Pending => {}
+            keycheck::Outcome::Close => self.overlay = Overlay::None,
+            keycheck::Outcome::Progress(report) => save_keycheck(check, &report),
+            keycheck::Outcome::Finished(report) => {
+                save_keycheck(check, &report);
+                self.set_clipboard(report);
+            }
+        }
+        true
+    }
+
+    /// Give the key to the open overlay. True if the key was used up; false
+    /// if it should still run as a global action or reach the editor.
+    fn overlay_key(&mut self, key: &KeyEvent, action: Option<Action>) -> bool {
+        match self.overlay {
+            Overlay::None => false,
+            Overlay::Explorer(_) => {
+                self.explorer_overlay_key(key, action);
+                true
+            }
+            Overlay::Picker(_) => {
+                self.picker_overlay_key(key, action);
+                true
+            }
+            Overlay::Rename { .. } => {
+                self.rename_overlay_key(key);
+                true
+            }
+            Overlay::AllKeys(_) => {
+                self.all_keys_overlay_key(key);
+                true
+            }
+            Overlay::Find(_) => {
+                self.find_overlay_key(key, action);
+                true
+            }
+            Overlay::KeyCheck(_) => true,
+            // Any key closes the documentation popup; only Esc is used up by it.
+            Overlay::Doc(_) => {
+                self.overlay = Overlay::None;
+                key.code == KeyCode::Esc
+            }
+        }
+    }
+
+    fn explorer_overlay_key(&mut self, key: &KeyEvent, action: Option<Action>) {
+        if matches!(action, Some(Action::ToggleExplorer)) {
+            self.close_overlay();
+            return;
+        }
+        let Overlay::Explorer(explorer) = &mut self.overlay else {
+            return;
+        };
+        match explorer.handle_key(key) {
+            explorer::Outcome::Pending => {}
+            explorer::Outcome::Close => self.close_overlay(),
+            explorer::Outcome::Open(path) => {
+                self.close_overlay();
+                self.open(&path, None);
+            }
+        }
+    }
+
+    fn picker_overlay_key(&mut self, key: &KeyEvent, action: Option<Action>) {
+        if matches!(
+            action,
+            Some(
+                Action::Launcher
+                    | Action::GotoFile
+                    | Action::GotoSymbol
+                    | Action::GotoLine
+                    | Action::SearchInFiles
+                    | Action::RecentFiles
+                    | Action::AllKeys
+                    | Action::Quit
+            )
+        ) {
+            self.overlay = Overlay::None;
+            self.run(action.unwrap_or(Action::None));
+            return;
+        }
+        let Overlay::Picker(picker) = &mut self.overlay else {
+            return;
+        };
+        match picker.handle_key(key) {
+            picker::Outcome::Pending => {
+                if picker.take_changed() {
+                    self.launcher_search();
+                }
+            }
+            picker::Outcome::Cancel => self.overlay = Overlay::None,
+            picker::Outcome::Pick(target) => {
+                self.overlay = Overlay::None;
+                self.pick(target);
+            }
+        }
+    }
+
+    fn rename_overlay_key(&mut self, key: &KeyEvent) {
+        let Overlay::Rename { path, pos, text } = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Enter => {
+                let (path, pos, name) = (path.clone(), *pos, text.clone());
+                self.overlay = Overlay::None;
+                self.request_rename(path, pos, name);
+            }
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Char(chr) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                text.push(chr);
+            }
+            _ => {}
+        }
+    }
+
+    fn all_keys_overlay_key(&mut self, key: &KeyEvent) {
+        let Overlay::AllKeys(keys) = &mut self.overlay else {
+            return;
+        };
+        match keys.handle_key(key) {
+            allkeys::Outcome::Pending => {}
+            allkeys::Outcome::Close => self.overlay = Overlay::None,
+            allkeys::Outcome::Run(action) => {
+                self.overlay = Overlay::None;
+                self.run(action);
+            }
+        }
+    }
+
+    fn find_overlay_key(&mut self, key: &KeyEvent, action: Option<Action>) {
+        let Overlay::Find(find) = &mut self.overlay else {
+            return;
+        };
+        let Some(doc) = visible(&mut self.docs, self.active, self.home) else {
+            self.overlay = Overlay::None;
+            return;
+        };
+        match find.handle_key(key, doc, &mut self.status) {
+            find::Outcome::Handled => {}
+            find::Outcome::Close => self.close_overlay(),
+            // Not a find key: global actions still work, typing does not.
+            find::Outcome::Ignored => {
+                if let Some(action) = action {
+                    self.run(action);
+                }
+            }
+        }
+    }
+
+    pub(super) fn edit_key(&mut self, key: KeyEvent) {
+        let Some(doc) = self.doc() else { return };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let motion = match key.code {
+            KeyCode::Left if ctrl => Some(Motion::WordLeft),
+            KeyCode::Right if ctrl => Some(Motion::WordRight),
+            KeyCode::Home if ctrl => Some(Motion::DocStart),
+            KeyCode::End if ctrl => Some(Motion::DocEnd),
+            KeyCode::Left => Some(Motion::Left),
+            KeyCode::Right => Some(Motion::Right),
+            KeyCode::Up => Some(Motion::Up),
+            KeyCode::Down => Some(Motion::Down),
+            KeyCode::Home => Some(Motion::LineStart),
+            KeyCode::End => Some(Motion::LineEnd),
+            KeyCode::PageUp => Some(Motion::PageUp),
+            KeyCode::PageDown => Some(Motion::PageDown),
+            _ => None,
+        };
+        if let Some(motion) = motion {
+            doc.state.move_carets(&doc.buffer, motion, shift);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => doc.state.collapse_to_primary(),
+            KeyCode::Enter => doc.newline(),
+            KeyCode::Tab => doc.type_text("    "),
+            KeyCode::Backspace => doc.backspace(ctrl),
+            KeyCode::Delete => doc.delete(ctrl),
+            KeyCode::Char(chr) if !ctrl && !alt => {
+                let mut utf8 = [0u8; 4];
+                doc.type_text(chr.encode_utf8(&mut utf8));
+            }
+            _ => {}
+        }
+        if let Some(doc) = self.doc()
+            && doc.state.selection_range().is_some_and(Range::is_empty)
+        {
+            doc.state.clear_selection();
+        }
+    }
+
+    pub(super) fn run(&mut self, action: Action) {
+        match action {
+            Action::None => {}
+            Action::Quit => self.quit_or_warn(),
+            Action::Save => self.save(),
+            Action::Launcher => self.open_launcher(Kind::All, ""),
+            Action::GotoFile => self.open_launcher(Kind::File, ""),
+            Action::GotoSymbol => self.open_launcher(Kind::Symbol, ""),
+            Action::GotoLine => self.open_launcher(Kind::All, ":"),
+            Action::SearchInFiles => self.search_in_files(),
+            Action::AllKeys => {
+                let keys = AllKeys::new(|key_action| self.display_key(key_action));
+                self.overlay = Overlay::AllKeys(keys);
+            }
+            Action::CheckKeys => self.overlay = Overlay::KeyCheck(KeyCheck::new()),
+            Action::Find | Action::Replace => self.open_find_bar(action == Action::Replace),
+            Action::FindNext | Action::FindPrev => self.find_step(action == Action::FindNext),
+            Action::RecentFiles => self.show_recent_files(),
+            Action::ToggleExplorer => self.open_tree(),
+            Action::GotoDefinition => self.request_nav(Nav::Definition),
+            Action::QuickDoc => self.request_hover(true),
+            Action::Problems => self.open_launcher(Kind::Problem, ""),
+            Action::NextProblem | Action::PrevProblem => {
+                self.step_problem(action == Action::NextProblem);
+            }
+            Action::GotoImplementation => self.request_nav(Nav::Implementation),
+            Action::FindUsages => self.request_nav(Nav::Usages),
+            Action::Rename => self.start_rename_overlay(),
+            Action::DuplicateLine => self.with_doc(Doc::duplicate_line),
+            Action::DeleteLine => self.with_doc(Doc::delete_line),
+            Action::ToggleComment => self.with_doc(Doc::toggle_comment),
+            Action::Reformat => self.reformat(),
+            Action::Complete => self.start_completion(),
+            Action::Undo => self.with_doc(Doc::undo),
+            Action::Redo => self.with_doc(Doc::redo),
+            Action::SelectAll => self.with_doc(|doc| doc.state.select_all(&doc.buffer)),
+            Action::Copy => self.copy_or_leave(),
+            Action::CopyLine => {
+                if let Some(doc) = self.cur() {
+                    let text = doc.current_line_text();
+                    self.set_clipboard(text);
+                    self.status = "Copied line".into();
+                }
+            }
+            Action::Cut => {
+                if let Some(text) = self.doc().map(Doc::cut) {
+                    self.set_clipboard(text);
+                }
+            }
+            Action::Paste => self.paste_clipboard(),
+            Action::CloseFile => self.close_active_file(),
+            Action::PreviousFile => self.open_previous_file(),
+            Action::NavBack => {
+                if let Some((path, pos)) = self.back.pop() {
+                    if let Some(here) = self.here() {
+                        self.forward.push(here);
+                    }
+                    self.open(&path, Some(pos));
+                }
+            }
+            Action::NavForward => {
+                if let Some((path, pos)) = self.forward.pop() {
+                    if let Some(here) = self.here() {
+                        self.back.push(here);
+                    }
+                    self.open(&path, Some(pos));
+                }
+            }
+            Action::Shell => self.shell_requested = true,
+        }
+    }
+
+    fn quit_or_warn(&mut self) {
+        let dirty: Vec<String> = self
+            .docs
+            .iter()
+            .filter(|doc| doc.buffer.is_dirty())
+            .map(|doc| self.rel(&doc.path).display().to_string())
+            .collect();
+        if dirty.is_empty() || self.armed == Some(Action::Quit) {
+            self.quit = true;
+        } else {
+            self.status = format!(
+                "Unsaved: {}. Press quit again to discard.",
+                dirty.join(", ")
+            );
+            self.confirm = Some(Action::Quit);
+        }
+    }
+
+    fn search_in_files(&mut self) {
+        let seed = self
+            .docs
+            .get(self.active)
+            .and_then(Doc::selected_text)
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or_default();
+        self.open_launcher(Kind::Text, &seed);
+    }
+
+    fn open_find_bar(&mut self, replace: bool) {
+        if let Overlay::Find(find) = &mut self.overlay {
+            // Already open: Alt+R adds the replace field, Ctrl+F refocuses the query.
+            if replace && find.replace.is_none() {
+                find.replace = Some(String::new());
+            }
+            find.in_replace = replace;
+            return;
+        }
+        let Some(doc) = visible(&mut self.docs, self.active, self.home) else {
+            return;
+        };
+        let mut find = Find::open(doc, replace, self.last_find.as_ref());
+        find.search(doc);
+        find.show(doc);
+        self.overlay = Overlay::Find(find);
+    }
+
+    fn find_step(&mut self, forward: bool) {
+        let Some(doc) = visible(&mut self.docs, self.active, self.home) else {
+            return;
+        };
+        match &mut self.overlay {
+            Overlay::Find(find) => find.step(doc, forward),
+            _ => {
+                if let Some(find) = &mut self.last_find
+                    && !find.jump_from_caret(doc, forward)
+                {
+                    self.status = format!("\"{}\" not found", find.query);
+                }
+            }
+        }
+    }
+
+    fn show_recent_files(&mut self) {
+        let items = self
+            .recent
+            .iter()
+            .map(|path| Item {
+                label: file_name(path),
+                detail: parent_dir(self.rel(path)),
+                target: Target::File(path.clone()),
+                kind: Kind::File,
+                keywords: "",
+            })
+            .collect();
+        let mut picker = Picker::new("Recent Files", items, true);
+        // The current file is first; preselect the one before it. On
+        // the home screen nothing is current, so the latest is first.
+        picker.select(usize::from(!self.home));
+        self.overlay = Overlay::Picker(picker);
+    }
+
+    fn start_rename_overlay(&mut self) {
+        if let Some(doc) = self.cur() {
+            let text = doc.word_at_caret().unwrap_or_default();
+            self.overlay = Overlay::Rename {
+                path: doc.path.clone(),
+                pos: doc.caret_utf16(),
+                text,
+            };
+        }
+    }
+
+    /// Ctrl+C: copy a selection; else leave the file for the home screen; on
+    /// the home screen, quit, as a terminal program should. Copy Line covers
+    /// `PyCharm`'s line copy.
+    fn copy_or_leave(&mut self) {
+        match self.cur().and_then(Doc::selected_text) {
+            Some(text) => self.set_clipboard(text),
+            None if self.cur().is_some() => {
+                // Home, with the tree open on the file just left.
+                self.open_tree();
+                self.home = true;
+                self.status = format!(
+                    "{} again quits; {} brings your files back",
+                    self.display_key(Action::Quit),
+                    self.display_key(Action::RecentFiles)
+                );
+            }
+            None => self.run(Action::Quit),
+        }
+    }
+
+    fn paste_clipboard(&mut self) {
+        let text = self.clipboard.clone();
+        let Some(doc) = self.doc() else { return };
+        let caret = doc.caret();
+        // A whole-line copy pastes above the current line, as in PyCharm.
+        if text.ends_with('\n') && doc.state.selection_range().is_none_or(Range::is_empty) {
+            doc.state.place_caret(LineCol::new(caret.line, 0));
+            doc.type_text(&text);
+            let lines = u32::try_from(text.matches('\n').count()).unwrap_or(u32::MAX);
+            let below = LineCol::new(caret.line.saturating_add(lines), caret.col);
+            doc.state.place_caret(doc.buffer.clamp(below));
+        } else {
+            let base = doc.buffer.version();
+            let edit =
+                karet_editor::editing::insert(caret, doc.state.selection_range(), base, &text);
+            doc.apply(edit, EditCause::Paste);
+        }
+    }
+
+    fn close_active_file(&mut self) {
+        if self.home {
+            return;
+        }
+        let Some(doc) = self.docs.get(self.active) else {
+            return;
+        };
+        if doc.buffer.is_dirty() && self.armed != Some(Action::CloseFile) {
+            self.status = "Unsaved changes: close again to discard".into();
+            self.confirm = Some(Action::CloseFile);
+            return;
+        }
+        let closed = self.docs.remove(self.active).path;
+        self.status.clear();
+        // Fall back to the most recently used file that is still open.
+        self.active = self
+            .recent
+            .iter()
+            .filter(|path| **path != closed)
+            .find_map(|path| self.docs.iter().position(|doc| doc.path == *path))
+            .unwrap_or(0);
+    }
+
+    fn open_previous_file(&mut self) {
+        let current = self.cur().map(|doc| doc.path.clone());
+        match self
+            .recent
+            .iter()
+            .find(|path| Some(*path) != current.as_ref())
+            .cloned()
+        {
+            Some(path) => self.open(&path, None),
+            None => self.status = "No previous file".into(),
+        }
+    }
+}

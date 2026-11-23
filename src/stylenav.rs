@@ -20,7 +20,7 @@ use crate::lsp::Nav;
 /// Files that can define or use style variables.
 fn is_style_file(path: &Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()),
+        path.extension().and_then(|ext| ext.to_str()),
         Some("css" | "scss" | "sass" | "less" | "html" | "htm" | "vue" | "svelte")
     )
 }
@@ -31,29 +31,44 @@ pub fn variable_at(path: &Path, line: &str, col: usize) -> Option<String> {
         return None;
     }
     let chars: Vec<char> = line.chars().collect();
-    let part = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
-    let mut start = col.min(chars.len());
-    while start > 0 && part(chars[start - 1]) {
-        start -= 1;
-    }
-    let mut end = col.min(chars.len());
-    while end < chars.len() && part(chars[end]) {
-        end += 1;
-    }
-    let word: String = chars[start..end].iter().collect();
+    let caret = col.min(chars.len());
+    let start = caret
+        - chars
+            .iter()
+            .take(caret)
+            .rev()
+            .take_while(|chr| is_name_part(**chr))
+            .count();
+    let end = caret
+        + chars
+            .iter()
+            .skip(caret)
+            .take_while(|chr| is_name_part(**chr))
+            .count();
+    let word: String = chars.get(start..end).unwrap_or_default().iter().collect();
     if let Some(name) = word
         .strip_prefix("--")
-        .filter(|n| !n.is_empty() && !n.starts_with('-'))
+        .filter(|name| !name.is_empty() && !name.starts_with('-'))
     {
         return Some(format!("--{name}"));
     }
-    let sigil = start.checked_sub(1).map(|i| chars[i]);
+    let sigil = start.checked_sub(1).and_then(|idx| chars.get(idx)).copied();
     match sigil {
-        Some(s @ ('$' | '@')) if !word.is_empty() && !word.starts_with('-') => {
-            Some(format!("{s}{word}"))
+        Some(prefix @ ('$' | '@')) if !word.is_empty() && !word.starts_with('-') => {
+            Some(format!("{prefix}{word}"))
         }
         _ => None,
     }
+}
+
+/// Whether `chr` can be part of a variable name.
+fn is_name_part(chr: char) -> bool {
+    chr.is_alphanumeric() || chr == '-' || chr == '_'
+}
+
+/// A count or index as `u32`, saturating for absurdly long lines.
+fn to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Search the project (open buffers win over the files on disk) and answer
@@ -69,32 +84,34 @@ pub fn search(
         let mut found = Vec::new();
         let files = ignore::WalkBuilder::new(&root)
             .hidden(false)
-            .filter_entry(|e| {
-                !(e.file_type().is_some_and(|t| t.is_dir())
-                    && crate::SKIP_DIRS.iter().any(|d| e.file_name() == *d))
+            .filter_entry(|entry| {
+                !(entry.file_type().is_some_and(|kind| kind.is_dir())
+                    && crate::SKIP_DIRS.iter().any(|dir| entry.file_name() == *dir))
             })
             .build()
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_some_and(|t| t.is_file()) && is_style_file(e.path()));
+            .filter(|entry| {
+                entry.file_type().is_some_and(|kind| kind.is_file()) && is_style_file(entry.path())
+            });
         for entry in files {
             let path = entry.path().to_path_buf();
             let text = match open.get(&path) {
-                Some(t) => t.clone(),
+                Some(text) => text.clone(),
                 None => match std::fs::read_to_string(&path) {
-                    Ok(t) => t,
+                    Ok(text) => text,
                     Err(_) => continue,
                 },
             };
-            for (at, len, is_definition) in occurrences(&text, &name) {
+            for (start, len, is_definition) in occurrences(&text, &name) {
                 let wanted = match nav {
                     Nav::Definition | Nav::Implementation => is_definition,
                     Nav::Usages => true,
                 };
                 if wanted {
-                    let end = LineCol::new(at.line, at.col + len);
+                    let end = LineCol::new(start.line, start.col + len);
                     found.push(Location {
                         path: path.clone(),
-                        range: Range { start: at, end },
+                        range: Range { start, end },
                     });
                 }
             }
@@ -113,26 +130,31 @@ fn occurrences(text: &str, name: &str) -> Vec<(LineCol, u32, bool)> {
     for (line_no, line) in text.lines().enumerate() {
         let chars: Vec<char> = line.chars().collect();
         let needle: Vec<char> = name.chars().collect();
-        let part = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
-        let mut i = 0;
-        while i + len <= chars.len() {
-            if chars[i..i + len] == needle[..] {
+        let mut idx = 0;
+        while idx + len <= chars.len() {
+            if chars.get(idx..idx + len) == Some(needle.as_slice()) {
                 // `.btn--brand` (a BEM class) is not `--brand`.
-                let before_ok = i == 0 || !part(chars[i - 1]);
-                let after_ok = chars.get(i + len).is_none_or(|c| !part(*c));
+                let before_ok = idx
+                    .checked_sub(1)
+                    .and_then(|prev| chars.get(prev))
+                    .is_none_or(|chr| !is_name_part(*chr));
+                let after_ok = chars.get(idx + len).is_none_or(|chr| !is_name_part(*chr));
                 if before_ok && after_ok {
-                    let rest: String = chars[i + len..].iter().collect();
-                    let is_definition = rest.trim_start().starts_with(':');
+                    let is_definition = chars
+                        .iter()
+                        .skip(idx + len)
+                        .find(|chr| !chr.is_whitespace())
+                        == Some(&':');
                     out.push((
-                        LineCol::new(line_no as u32, i as u32),
-                        len as u32,
+                        LineCol::new(to_u32(line_no), to_u32(idx)),
+                        to_u32(len),
                         is_definition,
                     ));
-                    i += len;
+                    idx += len;
                     continue;
                 }
             }
-            i += 1;
+            idx += 1;
         }
     }
     out
@@ -161,8 +183,10 @@ mod tests {
     fn tells_definitions_from_usages() {
         let text = ":root { --brand: red; --brand-dark: maroon; }\na { color: var(--brand); }\n.btn--brand {}";
         let found = occurrences(text, "--brand");
-        assert_eq!(found.len(), 2);
-        assert!(found[0].2);
-        assert!(!found[1].2);
+        let definitions: Vec<bool> = found
+            .iter()
+            .map(|(_, _, is_definition)| *is_definition)
+            .collect();
+        assert_eq!(definitions, [true, false]);
     }
 }

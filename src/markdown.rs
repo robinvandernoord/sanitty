@@ -27,8 +27,8 @@ pub fn words(line: &str) -> Vec<(String, Style, bool)> {
             space = true;
         }
     }
-    if let Some(w) = out.first_mut() {
-        w.2 = false;
+    if let Some(first_word) = out.first_mut() {
+        first_word.2 = false;
     }
     out
 }
@@ -43,56 +43,73 @@ pub fn inline(line: &str) -> Vec<(String, Style)> {
             out.push((std::mem::take(plain), Style::Plain));
         }
     };
+    // First index at or after `from` where `pat` (never empty) occurs.
     let find = |from: usize, pat: &[char]| -> Option<usize> {
-        (from..=chars.len().saturating_sub(pat.len())).find(|&j| chars[j..j + pat.len()] == *pat)
+        chars
+            .get(from..)?
+            .windows(pat.len())
+            .position(|window| window == pat)
+            .map(|pos| pos + from)
     };
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\\' && i + 1 < chars.len() && chars[i + 1].is_ascii_punctuation() {
-            plain.push(chars[i + 1]);
-            i += 2;
+    // The characters in `start..end` as a string.
+    let collect = |start: usize, end: usize| -> String {
+        chars.get(start..end).unwrap_or_default().iter().collect()
+    };
+    let mut idx = 0;
+    while let Some(&chr) = chars.get(idx) {
+        if chr == '\\'
+            && let Some(&escaped) = chars
+                .get(idx + 1)
+                .filter(|next| next.is_ascii_punctuation())
+        {
+            plain.push(escaped);
+            idx += 2;
             continue;
         }
-        if c == '`'
-            && let Some(end) = find(i + 1, &['`'])
+        if chr == '`'
+            && let Some(end) = find(idx + 1, &['`'])
         {
             flush(&mut plain, &mut out);
-            out.push((chars[i + 1..end].iter().collect(), Style::Code));
-            i = end + 1;
+            out.push((collect(idx + 1, end), Style::Code));
+            idx = end + 1;
             continue;
         }
-        if (c == '*' || c == '_') && chars.get(i + 1) == Some(&c) {
-            if let Some(end) = find(i + 2, &[c, c]).filter(|e| *e > i + 2) {
+        if (chr == '*' || chr == '_') && chars.get(idx + 1) == Some(&chr) {
+            if let Some(end) = find(idx + 2, &[chr, chr]).filter(|&pos| pos > idx + 2) {
                 flush(&mut plain, &mut out);
                 // Bold may wrap code (`**`x`**`): style the inside as its own runs.
-                for (t, s) in inline(&chars[i + 2..end].iter().collect::<String>()) {
-                    out.push((t, if s == Style::Plain { Style::Bold } else { s }));
+                for (text, style) in inline(&collect(idx + 2, end)) {
+                    let style = if style == Style::Plain {
+                        Style::Bold
+                    } else {
+                        style
+                    };
+                    out.push((text, style));
                 }
-                i = end + 2;
+                idx = end + 2;
                 continue;
             }
-        } else if (c == '*' || c == '_')
-            && chars.get(i + 1).is_some_and(|n| !n.is_whitespace())
-            && let Some(end) = find(i + 1, &[c]).filter(|e| *e > i + 1)
+        } else if (chr == '*' || chr == '_')
+            && chars.get(idx + 1).is_some_and(|next| !next.is_whitespace())
+            && let Some(end) = find(idx + 1, &[chr]).filter(|&pos| pos > idx + 1)
         {
             flush(&mut plain, &mut out);
-            out.push((chars[i + 1..end].iter().collect(), Style::Italic));
-            i = end + 1;
+            out.push((collect(idx + 1, end), Style::Italic));
+            idx = end + 1;
             continue;
         }
-        if c == '['
-            && let Some(close) = find(i + 1, &[']'])
+        if chr == '['
+            && let Some(close) = find(idx + 1, &[']'])
             && chars.get(close + 1) == Some(&'(')
             && let Some(end) = find(close + 2, &[')'])
         {
             flush(&mut plain, &mut out);
-            out.push((chars[i + 1..close].iter().collect(), Style::Link));
-            i = end + 1;
+            out.push((collect(idx + 1, close), Style::Link));
+            idx = end + 1;
             continue;
         }
-        plain.push(c);
-        i += 1;
+        plain.push(chr);
+        idx += 1;
     }
     flush(&mut plain, &mut out);
     out
@@ -121,12 +138,12 @@ mod tests {
 
     #[test]
     fn keeps_spaces_between_runs() {
-        let w: Vec<(String, bool)> = words("The **`pathname`** prop")
+        let pairs: Vec<(String, bool)> = words("The **`pathname`** prop")
             .into_iter()
-            .map(|(t, _, s)| (t, s))
+            .map(|(text, _, space)| (text, space))
             .collect();
         assert_eq!(
-            w,
+            pairs,
             [
                 ("The".into(), false),
                 ("pathname".into(), true),

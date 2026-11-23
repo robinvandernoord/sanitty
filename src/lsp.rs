@@ -1,8 +1,11 @@
-//! Language servers: one per language, started lazily the first time a file of
-//! that language opens. All requests run on tokio tasks and report back to the
-//! app loop as [`Event`]s, so the UI never blocks on a server.
+//! Language servers, started lazily the first time a file of their language
+//! opens: one main server per language (hover, navigation, colours, problems)
+//! plus, for Python, ruff as a linter (problems only). All requests run on tokio
+//! tasks and report back to the app loop as [`Event`]s, so the UI never blocks
+//! on a server.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,11 +31,11 @@ pub enum Nav {
 #[derive(Default)]
 pub struct Hub {
     clients: HashMap<&'static str, Arc<LspClient>>,
-    starting: HashMap<&'static str, ()>,
+    starting: HashSet<&'static str>,
     failed: HashMap<&'static str, String>,
 }
 
-/// A server key: TypeScript and JavaScript share one server.
+/// The main server's key: TypeScript and JavaScript share one server.
 fn server_key(lang: &str) -> &'static str {
     match lang {
         "python" => "python",
@@ -41,9 +44,23 @@ fn server_key(lang: &str) -> &'static str {
     }
 }
 
+/// Every server for a language: the main one first, then linters.
+fn server_keys(lang: &str) -> &'static [&'static str] {
+    match server_key(lang) {
+        "python" => &["python", "ruff"],
+        "rust" => &["rust"],
+        _ => &["ts"],
+    }
+}
+
+/// Linters only report problems; their absence is not worth a message.
+pub fn is_linter(key: &str) -> bool {
+    key == "ruff"
+}
+
 fn on_path(cmd: &str) -> bool {
     std::env::var_os("PATH")
-        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(cmd).is_file()))
 }
 
 /// The first installed server for a key.
@@ -61,10 +78,11 @@ fn spec_for(key: &str, root: &Path) -> Option<LspSpec> {
         return Some(LspSpec::new(
             tsc.display().to_string(),
             vec!["--lsp".into(), "--stdio".into()],
-            langs.iter().map(|s| (*s).to_string()).collect(),
+            langs.iter().map(|lang| (*lang).to_string()).collect(),
         ));
     }
     let candidates: &[(&str, &[&str], &[&str])] = match key {
+        "ruff" => &[("ruff", &["server"], &["python"])],
         // ty first (Astral, fast, beta); the others are fallbacks.
         "python" => &[
             ("ty", &["server"], &["python"]),
@@ -90,8 +108,8 @@ fn spec_for(key: &str, root: &Path) -> Option<LspSpec> {
         .map(|(cmd, args, langs)| {
             LspSpec::new(
                 *cmd,
-                args.iter().map(|s| (*s).to_string()).collect(),
-                langs.iter().map(|s| (*s).to_string()).collect(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+                langs.iter().map(|lang| (*lang).to_string()).collect(),
             )
         })?;
     if spec.command == "typescript-language-server" {
@@ -100,7 +118,7 @@ fn spec_for(key: &str, root: &Path) -> Option<LspSpec> {
         // use a global install, which it must be pointed at.
         let tsserver = find_tsserver(root);
         return Some(spec.with_initialization_options(
-            tsserver.map(|p| serde_json::json!({ "tsserver": { "path": p } })),
+            tsserver.map(|path| serde_json::json!({ "tsserver": { "path": path } })),
         ));
     }
     Some(spec)
@@ -111,7 +129,7 @@ fn spec_for(key: &str, root: &Path) -> Option<LspSpec> {
 fn native_tsc(root: &Path) -> Option<PathBuf> {
     let local = root.join("node_modules/.bin/tsc");
     let candidates = [
-        Some(local).filter(|p| p.is_file()),
+        Some(local).filter(|path| path.is_file()),
         on_path("tsc").then(|| PathBuf::from("tsc")),
     ];
     candidates.into_iter().flatten().find(|tsc| {
@@ -119,9 +137,10 @@ fn native_tsc(root: &Path) -> Option<PathBuf> {
             .arg("--version")
             .output()
             .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|v| {
-                v.trim()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|version| {
+                version
+                    .trim()
                     .strip_prefix("Version ")?
                     .split('.')
                     .next()?
@@ -147,37 +166,70 @@ fn find_tsserver(root: &Path) -> Option<PathBuf> {
     candidates
         .iter()
         .map(|dir| dir.join("typescript/lib/tsserver.js"))
-        .find(|p| p.is_file())
+        .find(|path| path.is_file())
 }
 
 impl Hub {
+    /// The main server for `lang`.
     pub fn client(&self, lang: &str) -> Option<Arc<LspClient>> {
         self.clients.get(server_key(lang)).cloned()
     }
 
-    /// Any running server, for workspace-wide queries with no file open.
+    /// Every running server for `lang` (main and linters), with its key.
+    pub fn running(&self, lang: &str) -> Vec<(&'static str, Arc<LspClient>)> {
+        server_keys(lang)
+            .iter()
+            .filter_map(|key| Some((*key, self.clients.get(key)?.clone())))
+            .collect()
+    }
+
+    /// Any running main server, for workspace-wide queries with no file open.
     pub fn any_client(&self) -> Option<Arc<LspClient>> {
-        self.clients.values().next().cloned()
+        self.clients
+            .iter()
+            .find(|(key, _)| !is_linter(key))
+            .map(|(_, client)| client.clone())
     }
 
     pub fn status(&self) -> String {
-        let mut parts: Vec<String> = self.clients.keys().map(|k| (*k).to_string()).collect();
-        parts.extend(self.starting.keys().map(|k| format!("{k}..")));
-        parts.extend(self.failed.keys().map(|k| format!("{k}!")));
+        let mut parts: Vec<String> = self.clients.keys().map(|key| (*key).to_string()).collect();
+        parts.extend(self.starting.iter().map(|key| format!("{key}..")));
+        parts.extend(
+            self.failed
+                .iter()
+                .filter(|(_, msg)| !msg.is_empty())
+                .map(|(key, _)| format!("{key}!")),
+        );
         parts.sort();
         parts.join(" ")
     }
 
-    /// Start the server for `lang` if it is not running or starting yet.
+    /// Start the servers for `lang` that are not running or starting yet.
     pub fn ensure(&mut self, lang: &str, root: &Path, tx: &UnboundedSender<Event>) {
-        let key = server_key(lang);
+        for key in server_keys(lang) {
+            self.ensure_key(key, lang, root, tx);
+        }
+    }
+
+    fn ensure_key(
+        &mut self,
+        key: &'static str,
+        lang: &str,
+        root: &Path,
+        tx: &UnboundedSender<Event>,
+    ) {
         if self.clients.contains_key(key)
-            || self.starting.contains_key(key)
+            || self.starting.contains(key)
             || self.failed.contains_key(key)
         {
             return;
         }
         let Some(spec) = spec_for(key, root) else {
+            if is_linter(key) {
+                // Not installed: remember quietly, so it is not looked up again.
+                self.failed.insert(key, String::new());
+                return;
+            }
             self.failed
                 .insert(key, format!("no language server installed for {lang}"));
             let _ = tx.send(Event::Status(format!(
@@ -185,7 +237,7 @@ impl Hub {
             )));
             return;
         };
-        self.starting.insert(key, ());
+        self.starting.insert(key);
         let root = root.to_path_buf();
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -194,18 +246,21 @@ impl Hub {
                 Ok(client) => {
                     let client = Arc::new(client);
                     let mut diags = client.diagnostics();
-                    let dtx = tx.clone();
+                    let diag_tx = tx.clone();
                     tokio::spawn(async move {
-                        while let Ok(d) = diags.recv().await {
-                            if dtx.send(Event::Diagnostics(d.path, d.diagnostics)).is_err() {
+                        while let Ok(report) = diags.recv().await {
+                            if diag_tx
+                                .send(Event::Diagnostics(key, report.path, report.diagnostics))
+                                .is_err()
+                            {
                                 break;
                             }
                         }
                     });
                     let _ = tx.send(Event::LspReady(key, client));
                 }
-                Err(e) => {
-                    let _ = tx.send(Event::LspFailed(key, format!("{name}: {e}")));
+                Err(err) => {
+                    let _ = tx.send(Event::LspFailed(key, format!("{name}: {err}")));
                 }
             }
         });
@@ -222,12 +277,12 @@ impl Hub {
     }
 
     pub fn is_key(lang: &str, key: &str) -> bool {
-        server_key(lang) == key
+        server_keys(lang).contains(&key)
     }
 }
 
 pub fn did_open(
-    client: Arc<LspClient>,
+    (key, client): (&'static str, Arc<LspClient>),
     path: PathBuf,
     lang: &'static str,
     version: i32,
@@ -238,10 +293,17 @@ pub fn did_open(
         let _ = client.did_open(&path, lang, version, &text).await;
         // Right after start-up a server may not answer yet (or not have
         // registered its features); retry for a few seconds.
-        let (mut problems, mut colours) = (false, false);
-        for _ in 0..8 {
-            problems = problems || pull(&client, &path, &tx).await;
-            colours = colours || semantic(&client, &path, version, &tx).await;
+        // A server can register features after it starts (ty does), so
+        // "unsupported" is only believed after a couple of seconds.
+        let (mut problems, mut colours) = (false, is_linter(key));
+        for attempt in 0..8 {
+            let settled = |answer: Answer| match answer {
+                Answer::Done => true,
+                Answer::Unsupported => attempt >= 4,
+                Answer::Failed => false,
+            };
+            problems = problems || settled(pull(key, &client, &path, &tx).await);
+            colours = colours || settled(semantic(&client, &path, version, &tx).await);
             if problems && colours {
                 break;
             }
@@ -251,7 +313,7 @@ pub fn did_open(
 }
 
 pub fn did_change(
-    client: Arc<LspClient>,
+    (key, client): (&'static str, Arc<LspClient>),
     path: PathBuf,
     version: i32,
     text: String,
@@ -259,36 +321,68 @@ pub fn did_change(
 ) {
     tokio::spawn(async move {
         let _ = client.did_change(&path, version, &text).await;
-        pull(&client, &path, &tx).await;
-        semantic(&client, &path, version, &tx).await;
+        pull(key, &client, &path, &tx).await;
+        if !is_linter(key) {
+            semantic(&client, &path, version, &tx).await;
+        }
     });
 }
 
-pub fn did_save(client: Arc<LspClient>, path: PathBuf, tx: UnboundedSender<Event>) {
+pub fn did_save(
+    (key, client): (&'static str, Arc<LspClient>),
+    path: PathBuf,
+    tx: UnboundedSender<Event>,
+) {
     tokio::spawn(async move {
         let _ = client.did_save(&path, None).await;
-        pull(&client, &path, &tx).await;
+        pull(key, &client, &path, &tx).await;
     });
+}
+
+/// How a request a server may not support went.
+enum Answer {
+    Done,
+    Unsupported,
+    Failed,
+}
+
+impl Answer {
+    fn from_error(err: &LspError) -> Self {
+        if matches!(err, LspError::Unsupported { .. }) {
+            Self::Unsupported
+        } else {
+            Self::Failed
+        }
+    }
 }
 
 /// Ask for a document's problems, for servers (ty) that only report when
 /// asked. Servers that push them instead answer `Unsupported`, which is fine.
-/// Returns whether this is settled: answered, or not offered by the server.
-async fn pull(client: &LspClient, path: &Path, tx: &UnboundedSender<Event>) -> bool {
+async fn pull(
+    key: &'static str,
+    client: &LspClient,
+    path: &Path,
+    tx: &UnboundedSender<Event>,
+) -> Answer {
     let report = match client.pull_diagnostics(path, None).await {
-        Ok(r) => r,
-        Err(e) => {
-            crate::debug_log(&format!("pull {}: {e}", path.display()));
-            return matches!(e, LspError::Unsupported { .. });
+        Ok(report) => report,
+        Err(err) => {
+            crate::debug_log(&format!("pull {key} {}: {err}", path.display()));
+            return Answer::from_error(&err);
         }
     };
+    crate::debug_log(&format!(
+        "pull {key} {}: {:?} problems",
+        path.display(),
+        report.diagnostics.as_ref().map(Vec::len)
+    ));
     if let Some(diags) = report.diagnostics {
-        let _ = tx.send(Event::Diagnostics(path.to_path_buf(), diags));
+        let _ = tx.send(Event::Diagnostics(key, path.to_path_buf(), diags));
     }
     for other in report.related {
-        let _ = tx.send(Event::Diagnostics(other.path, other.diagnostics));
+        let _ = tx.send(Event::Diagnostics(key, other.path, other.diagnostics));
     }
-    true
+    Answer::Done
 }
 
 /// Ask for hover text at `pos16` (UTF-16); the answer is tagged with the
@@ -307,14 +401,14 @@ pub fn hover(
             .await
             .ok()
             .flatten()
-            .map(|h| {
+            .map(|hover| {
                 crate::debug_log(&format!(
                     "hover ({:?}): {:?}",
-                    h.contents.kind, h.contents.value
+                    hover.contents.kind, hover.contents.value
                 ));
-                h.contents.value
+                hover.contents.value
             })
-            .filter(|t| !t.trim().is_empty());
+            .filter(|text| !text.trim().is_empty());
         let _ = tx.send(Event::Hover(path, pos, text, popup));
     });
 }
@@ -327,9 +421,9 @@ async fn semantic(
     path: &Path,
     version: i32,
     tx: &UnboundedSender<Event>,
-) -> bool {
+) -> Answer {
     let Some(legend) = client.semantic_tokens_legend() else {
-        return false;
+        return Answer::Unsupported;
     };
     match client.semantic_tokens(path, None).await {
         Ok(tokens) => {
@@ -338,11 +432,11 @@ async fn semantic(
                 version,
                 tokens.decode(&legend),
             ));
-            true
+            Answer::Done
         }
-        Err(e) => {
-            crate::debug_log(&format!("semantic {}: {e}", path.display()));
-            matches!(e, LspError::Unsupported { .. })
+        Err(err) => {
+            crate::debug_log(&format!("semantic {}: {err}", path.display()));
+            Answer::from_error(&err)
         }
     }
 }
@@ -362,8 +456,82 @@ pub fn navigate(
         };
         let _ = tx.send(match result {
             Ok(locs) => Event::Locations(nav, locs),
-            Err(e) => Event::Status(format!("{nav:?}: {e}")),
+            Err(err) => Event::Status(format!("{nav:?}: {err}")),
         });
+    });
+}
+
+/// Ask the first of `servers` that can format `path` (ruff before ty, which
+/// cannot) for the edits that reformat it as it is at `version`.
+pub fn format(
+    servers: Vec<(&'static str, Arc<LspClient>)>,
+    path: PathBuf,
+    version: u64,
+    indentation: karet_lsp::Indentation,
+    tx: UnboundedSender<Event>,
+) {
+    let Some(client) = servers
+        .into_iter()
+        .rev()
+        .map(|(_, client)| client)
+        .find(|client| client.supports_formatting(&path))
+    else {
+        let _ = tx.send(Event::Status(
+            "No formatter for this file (its language servers cannot format)".into(),
+        ));
+        return;
+    };
+    tokio::spawn(async move {
+        let _ = tx.send(match client.formatting(&path, indentation).await {
+            Ok(edits) => Event::Formatted(path, version, edits),
+            Err(err) => Event::Status(format!("Reformat: {err}")),
+        });
+    });
+}
+
+/// Ask `client` for completions at `pos16` (UTF-16), tagged with `generation`.
+pub fn complete(
+    client: Arc<LspClient>,
+    path: PathBuf,
+    pos16: LineCol,
+    trigger: karet_core::CompletionTrigger,
+    generation: u64,
+    tx: UnboundedSender<Event>,
+) {
+    tokio::spawn(async move {
+        let answer = client
+            .completion(&path, pos16, trigger)
+            .await
+            .map_err(|err| err.to_string());
+        if let Ok(list) = &answer {
+            crate::debug_log(&format!(
+                "completion {}: {} items{}",
+                path.display(),
+                list.items.len(),
+                if list.incomplete { " (incomplete)" } else { "" }
+            ));
+        }
+        let _ = tx.send(Event::Completions(generation, answer));
+    });
+}
+
+/// Ask `client` to fill in what it left out of a completion item (its docs,
+/// an import it needs).
+pub fn resolve_completion(
+    client: Arc<LspClient>,
+    item: karet_core::CompletionItem,
+    generation: u64,
+    index: usize,
+    tx: UnboundedSender<Event>,
+) {
+    tokio::spawn(async move {
+        let resolved = client
+            .resolve_completion(&item)
+            .await
+            .ok()
+            .flatten()
+            .map(Box::new);
+        let _ = tx.send(Event::CompletionResolved(generation, index, resolved));
     });
 }
 
@@ -377,7 +545,7 @@ pub fn rename(
     tokio::spawn(async move {
         let _ = tx.send(match client.rename(&path, pos, &new_name).await {
             Ok(edit) => Event::Rename(edit),
-            Err(e) => Event::Status(format!("Rename: {e}")),
+            Err(err) => Event::Status(format!("Rename: {err}")),
         });
     });
 }
@@ -387,17 +555,17 @@ pub fn describe(loc: &Location, root: &Path) -> (String, String) {
     let rel = loc.path.strip_prefix(root).unwrap_or(&loc.path);
     let line = std::fs::read_to_string(&loc.path)
         .ok()
-        .and_then(|t| {
-            t.lines()
+        .and_then(|text| {
+            text.lines()
                 .nth(loc.range.start.line as usize)
-                .map(|l| l.trim().to_string())
+                .map(|line| line.trim().to_string())
         })
         .unwrap_or_default();
     // File name and line first (the directory is in the picker's bottom
     // border), then the code on that line.
     let name = rel.file_name().map_or_else(
         || rel.display().to_string(),
-        |n| n.to_string_lossy().into_owned(),
+        |file_name| file_name.to_string_lossy().into_owned(),
     );
     (format!("{name}:{}", loc.range.start.line + 1), line)
 }

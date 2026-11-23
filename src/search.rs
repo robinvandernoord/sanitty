@@ -33,19 +33,21 @@ pub fn text(
     tx: UnboundedSender<Event>,
 ) {
     std::thread::spawn(move || {
-        let q = SearchQuery {
+        let started = std::time::Instant::now();
+        let search_query = SearchQuery {
             pattern: query.clone(),
             case_sensitive: query.chars().any(char::is_uppercase),
             ..Default::default()
         };
-        let Ok(matcher) = Matcher::new(&q) else {
+        let Ok(matcher) = Matcher::new(&search_query) else {
+            let _ = tx.send(Event::Launcher(generation, Kind::Text, Vec::new()));
             return;
         };
         let mut items = Vec::new();
         // karet-search already prunes .git, target and node_modules.
         let excludes: Vec<String> = crate::SKIP_DIRS
             .iter()
-            .map(|d| format!("**/{d}/**"))
+            .map(|dir| format!("**/{dir}/**"))
             .collect();
         let _ = karet_search::walk_text_files(&root, &[], &excludes, |path, text| {
             if current.load(Ordering::Relaxed) != generation {
@@ -53,13 +55,13 @@ pub fn text(
             }
             let mut last_line = None;
             // One hit per line: several matches on a line would list it twice.
-            for m in matcher
+            for found in matcher
                 .find(&text)
                 .into_iter()
-                .filter(|m| last_line.replace(m.line) != Some(m.line))
+                .filter(|found| last_line.replace(found.line) != Some(found.line))
                 .take(20)
             {
-                items.push(hit(&root, path, &text, m.start, m.line, m.col));
+                items.push(hit(&root, path, &text, found.start, found.line, found.col));
                 if items.len() >= MAX_TEXT_HITS {
                     return ControlFlow::Break(());
                 }
@@ -67,19 +69,25 @@ pub fn text(
             ControlFlow::Continue(())
         });
         if current.load(Ordering::Relaxed) == generation {
+            crate::debug_log(&format!(
+                "text search {query:?}: {} hits in {:?}",
+                items.len(),
+                started.elapsed()
+            ));
             let _ = tx.send(Event::Launcher(generation, Kind::Text, items));
         }
     });
 }
 
 fn hit(root: &Path, path: &Path, text: &str, start: usize, line: u32, col: u32) -> Item {
-    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = text[start..].find('\n').map_or(text.len(), |i| start + i);
-    let line_text = &text[line_start..line_end];
+    let (before, after) = text.split_at_checked(start).unwrap_or((text, ""));
+    let line_start = before.rfind('\n').map_or(0, |idx| idx + 1);
+    let line_end = after.find('\n').map_or(text.len(), |idx| start + idx);
+    let line_text = text.get(line_start..line_end).unwrap_or_default();
     // LSP-style UTF-16 column, which `App::jump` expects.
-    let col16 = line_text
-        .get(..col as usize)
-        .map_or(0, |p| p.encode_utf16().count() as u32);
+    let col16 = line_text.get(..col as usize).map_or(0, |prefix| {
+        u32::try_from(prefix.encode_utf16().count()).unwrap_or(u32::MAX)
+    });
     let rel = path.strip_prefix(root).unwrap_or(path);
     Item {
         label: line_text.trim().chars().take(120).collect(),
@@ -99,31 +107,32 @@ pub fn symbols(
 ) {
     tokio::spawn(async move {
         let Ok(found) = client.workspace_symbols(&query).await else {
+            let _ = tx.send(Event::Launcher(generation, Kind::Symbol, Vec::new()));
             return;
         };
         let items = found
             .into_iter()
             .take(200)
-            .map(|s| {
-                let rel = s
+            .map(|symbol| {
+                let rel = symbol
                     .path
                     .strip_prefix(&root)
-                    .unwrap_or(&s.path)
+                    .unwrap_or(&symbol.path)
                     .display()
                     .to_string();
-                let detail = match (&s.container_name, s.range) {
-                    (Some(c), Some(r)) if !c.is_empty() => {
-                        format!("{c}  {rel}:{}", r.start.line + 1)
+                let detail = match (&symbol.container_name, symbol.range) {
+                    (Some(container), Some(range)) if !container.is_empty() => {
+                        format!("{container}  {rel}:{}", range.start.line + 1)
                     }
-                    (_, Some(r)) => format!("{rel}:{}", r.start.line + 1),
+                    (_, Some(range)) => format!("{rel}:{}", range.start.line + 1),
                     _ => rel,
                 };
-                let target = match s.range {
-                    Some(r) => Target::Location(s.path.clone(), r.start),
-                    None => Target::File(s.path.clone()),
+                let target = match symbol.range {
+                    Some(range) => Target::Location(symbol.path.clone(), range.start),
+                    None => Target::File(symbol.path.clone()),
                 };
                 Item {
-                    label: s.name,
+                    label: symbol.name,
                     detail,
                     target,
                     kind: Kind::Symbol,

@@ -1,15 +1,15 @@
 //! Actions and the key bindings that trigger them.
 //!
-//! Defaults follow PyCharm. Ghostty speaks the kitty keyboard protocol, so chords
-//! like `Ctrl+Shift+N` arrive intact there; terminals without it (xterm.js based
-//! ones such as the T3 integrated terminal) fold `Ctrl+Shift+N` into `Ctrl+N`, so
-//! every shifted chord also gets a fallback that survives legacy encoding.
+//! One default key per action, built on Alt: T3's terminal claims many Ctrl
+//! keys and may claim more. Only the universal Ctrl keys (copy, cut, paste,
+//! undo, save, select all, find) and `PyCharm`'s F-keys remain. Every default
+//! arrived in both T3 and Ghostty in the key check (`sanitty --check-keys`).
 //!
 //! Users override bindings in `$XDG_CONFIG_HOME/sanitty/keymap.toml`:
 //!
 //! ```toml
 //! [bindings]
-//! "ctrl+b" = "goto-definition"
+//! "f12" = "goto-definition"
 //! "alt+n" = "goto-file"
 //! "ctrl+w" = "none"          # unbind
 //! ```
@@ -55,6 +55,8 @@ pub enum Action {
     DuplicateLine,
     DeleteLine,
     ToggleComment,
+    Reformat,
+    Complete,
     Undo,
     Redo,
     Copy,
@@ -106,6 +108,8 @@ impl Action {
         ),
         (Action::PrevProblem, "Previous Problem", "Code"),
         (Action::ToggleComment, "Comment with Line Comment", "Code"),
+        (Action::Reformat, "Reformat File", "Code"),
+        (Action::Complete, "Code Completion", "Code"),
         (Action::DuplicateLine, "Duplicate Line", "Edit"),
         (Action::DeleteLine, "Delete Line", "Edit"),
         (Action::Undo, "Undo", "Edit"),
@@ -128,7 +132,7 @@ impl Action {
     ];
 
     /// Other words people search for, so the launcher finds "jump to source"
-    /// or "references" without knowing PyCharm's exact label.
+    /// or "references" without knowing `PyCharm`'s exact label.
     pub fn keywords(self) -> &'static str {
         match self {
             Action::Launcher => "search everywhere launcher anything",
@@ -155,6 +159,8 @@ impl Action {
                 "problem error warning diagnostic lint issue highlighted"
             }
             Action::ToggleComment => "comment uncomment",
+            Action::Reformat => "format formatter reformat code style ruff rustfmt tidy",
+            Action::Complete => "complete completion autocomplete suggest suggestions intellisense",
             Action::DuplicateLine => "duplicate clone copy line",
             Action::DeleteLine => "delete remove kill line",
             Action::Undo => "undo revert",
@@ -176,8 +182,8 @@ impl Action {
     pub fn label(self) -> &'static str {
         Self::ALL
             .iter()
-            .find(|(a, ..)| *a == self)
-            .map_or("", |(_, l, _)| l)
+            .find(|(action, ..)| *action == self)
+            .map_or("", |(_, label, _)| label)
     }
 }
 
@@ -192,13 +198,13 @@ pub struct Chord {
 impl Chord {
     /// Normalize a terminal key event so `Ctrl+Shift+N` matches however the
     /// terminal spelled it (`N` with SHIFT, `N` without, or `n` with SHIFT).
-    pub fn from_event(ev: &KeyEvent) -> Self {
+    pub fn from_event(event: &KeyEvent) -> Self {
         let mut mods =
-            ev.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
-        let code = match ev.code {
-            KeyCode::Char(c) if c.is_ascii_uppercase() => {
+            event.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let code = match event.code {
+            KeyCode::Char(chr) if chr.is_ascii_uppercase() => {
                 mods |= KeyModifiers::SHIFT;
-                KeyCode::Char(c.to_ascii_lowercase())
+                KeyCode::Char(chr.to_ascii_lowercase())
             }
             KeyCode::BackTab => {
                 mods |= KeyModifiers::SHIFT;
@@ -229,7 +235,7 @@ impl Chord {
                     code = Some(
                         parse_code(key)
                             .ok_or_else(|| format!("unknown key {key:?} in {spec:?}"))?,
-                    )
+                    );
                 }
             }
         }
@@ -257,81 +263,79 @@ fn parse_code(key: &str) -> Option<KeyCode> {
         "space" => KeyCode::Char(' '),
         "slash" => KeyCode::Char('/'),
         "plus" => KeyCode::Char('+'),
-        k if k.len() > 1 && k.starts_with('f') => KeyCode::F(k[1..].parse().ok()?),
-        k if k.chars().count() == 1 => KeyCode::Char(k.chars().next()?),
+        _ if key.len() > 1 && key.starts_with('f') => {
+            KeyCode::F(key.strip_prefix('f')?.parse().ok()?)
+        }
+        _ if key.chars().count() == 1 => KeyCode::Char(key.chars().next()?),
         _ => return None,
     })
 }
 
 impl fmt::Display for Chord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.mods.contains(KeyModifiers::CONTROL) {
-            f.write_str("Ctrl+")?;
+            formatter.write_str("Ctrl+")?;
         }
         if self.mods.contains(KeyModifiers::ALT) {
-            f.write_str("Alt+")?;
+            formatter.write_str("Alt+")?;
         }
         if self.mods.contains(KeyModifiers::SHIFT) {
-            f.write_str("Shift+")?;
+            formatter.write_str("Shift+")?;
         }
         match self.code {
-            KeyCode::Char(' ') => f.write_str("Space"),
-            KeyCode::Char(c) => write!(f, "{}", c.to_ascii_uppercase()),
-            KeyCode::F(n) => write!(f, "F{n}"),
-            other => write!(f, "{other:?}"),
+            KeyCode::Char(' ') => formatter.write_str("Space"),
+            KeyCode::Char(chr) => write!(formatter, "{}", chr.to_ascii_uppercase()),
+            KeyCode::F(num) => write!(formatter, "F{num}"),
+            other => write!(formatter, "{other:?}"),
         }
     }
 }
 
-/// Default bindings. The first entry for an action is the one shown in the hint
-/// bar and All Keys: it arrives in both T3's terminal and Ghostty (see the key
-/// check reports). Later entries are PyCharm keys kept for terminals that do
-/// deliver them.
+/// Default bindings: exactly one key per action. New ones come from the free
+/// keys in PLAN.md (keys that arrived in both terminals), preferring Alt.
 pub const DEFAULTS: &[(&str, Action)] = &[
-    ("alt+q", Action::Quit),
-    ("ctrl+shift+q", Action::Quit),
-    ("ctrl+s", Action::Save),
-    ("ctrl+k", Action::Launcher),
+    // Navigate
+    ("alt+k", Action::Launcher),
     ("alt+n", Action::GotoFile),
-    ("ctrl+shift+n", Action::GotoFile),
-    ("ctrl+alt+shift+n", Action::GotoSymbol),
-    ("ctrl+g", Action::GotoLine),
-    ("alt+f", Action::SearchInFiles),
-    ("ctrl+shift+f", Action::SearchInFiles),
-    ("ctrl+e", Action::RecentFiles),
+    ("alt+s", Action::GotoSymbol),
+    ("alt+g", Action::GotoLine),
+    ("alt+e", Action::RecentFiles),
     ("alt+1", Action::ToggleExplorer),
-    ("f1", Action::AllKeys),
+    ("alt+,", Action::NavBack),
+    ("alt+.", Action::NavForward),
+    // Search
     ("ctrl+f", Action::Find),
-    ("ctrl+r", Action::Replace),
+    ("alt+r", Action::Replace),
     ("f3", Action::FindNext),
     ("shift+f3", Action::FindPrev),
+    ("alt+f", Action::SearchInFiles),
+    // Code
     ("alt+b", Action::GotoDefinition),
-    ("ctrl+b", Action::GotoDefinition),
     ("alt+i", Action::GotoImplementation),
-    ("ctrl+alt+b", Action::GotoImplementation),
     ("alt+f7", Action::FindUsages),
     ("alt+h", Action::QuickDoc),
+    ("f2", Action::Rename),
     ("alt+6", Action::Problems),
     ("f8", Action::NextProblem),
     ("shift+f8", Action::PrevProblem),
-    ("f2", Action::Rename),
-    ("shift+f6", Action::Rename),
-    ("ctrl+d", Action::DuplicateLine),
-    ("ctrl+y", Action::DeleteLine),
-    ("ctrl+/", Action::ToggleComment),
+    ("alt+/", Action::ToggleComment),
+    ("alt+l", Action::Reformat),
+    ("alt+j", Action::Complete),
+    // Edit
+    ("alt+d", Action::DuplicateLine),
+    ("alt+y", Action::DeleteLine),
     ("ctrl+z", Action::Undo),
-    ("ctrl+shift+z", Action::Redo),
     ("alt+z", Action::Redo),
     ("ctrl+c", Action::Copy),
     ("ctrl+x", Action::Cut),
     ("ctrl+v", Action::Paste),
     ("ctrl+a", Action::SelectAll),
+    // File and app
+    ("ctrl+s", Action::Save),
     ("alt+w", Action::CloseFile),
-    ("ctrl+f4", Action::CloseFile),
-    ("ctrl+alt+left", Action::NavBack),
-    ("ctrl+alt+right", Action::NavForward),
-    ("alt+f12", Action::Shell),
+    ("f1", Action::AllKeys),
     ("alt+t", Action::Shell),
+    ("alt+q", Action::Quit),
 ];
 
 #[derive(Deserialize, Default)]
@@ -356,7 +360,7 @@ impl Keymap {
             }
         }
         let mut problems = Vec::new();
-        if let Some(path) = crate::config_dir().map(|d| d.join("keymap.toml"))
+        if let Some(path) = crate::config_dir().map(|dir| dir.join("keymap.toml"))
             && let Ok(text) = std::fs::read_to_string(&path)
         {
             match toml::from_str::<UserKeymap>(&text) {
@@ -369,25 +373,23 @@ impl Keymap {
                             Ok(chord) => {
                                 map.insert(chord, action);
                             }
-                            Err(e) => problems.push(format!("keymap.toml: {e}")),
+                            Err(err) => problems.push(format!("keymap.toml: {err}")),
                         }
                     }
                 }
-                Err(e) => problems.push(format!("{}: {e}", path.display())),
+                Err(err) => problems.push(format!("{}: {err}", path.display())),
             }
         }
         (Self { map }, problems)
     }
 
-    pub fn lookup(&self, ev: &KeyEvent) -> Option<Action> {
-        let chord = Chord::from_event(ev);
-        if let Some(a) = self.map.get(&chord) {
-            return Some(*a);
+    pub fn lookup(&self, event: &KeyEvent) -> Option<Action> {
+        let chord = Chord::from_event(event);
+        if let Some(action) = self.map.get(&chord) {
+            return Some(*action);
         }
         // Legacy terminals send Ctrl+/ as Ctrl+7 or Ctrl+_.
-        if chord.mods == KeyModifiers::CONTROL
-            && matches!(chord.code, KeyCode::Char('7') | KeyCode::Char('_'))
-        {
+        if chord.mods == KeyModifiers::CONTROL && matches!(chord.code, KeyCode::Char('7' | '_')) {
             return self
                 .map
                 .get(&Chord {
@@ -403,13 +405,13 @@ impl Keymap {
     pub fn chords_for(&self, action: Action) -> Vec<Chord> {
         let mut out: Vec<Chord> = DEFAULTS
             .iter()
-            .filter(|(_, a)| *a == action)
-            .filter_map(|(s, _)| Chord::parse(s).ok())
-            .filter(|c| self.map.get(c) == Some(&action))
+            .filter(|(_, bound)| *bound == action)
+            .filter_map(|(spec, _)| Chord::parse(spec).ok())
+            .filter(|chord| self.map.get(chord) == Some(&action))
             .collect();
-        for (c, a) in &self.map {
-            if *a == action && !out.contains(c) {
-                out.push(*c);
+        for (chord, bound) in &self.map {
+            if *bound == action && !out.contains(chord) {
+                out.push(*chord);
             }
         }
         out
@@ -421,18 +423,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shifted_letters_normalize() {
-        let a = Chord::from_event(&KeyEvent::new(KeyCode::Char('N'), KeyModifiers::CONTROL));
-        let b = Chord::from_event(&KeyEvent::new(
+    fn shifted_letters_normalize() -> Result<(), String> {
+        let upper = Chord::from_event(&KeyEvent::new(KeyCode::Char('N'), KeyModifiers::CONTROL));
+        let shifted = Chord::from_event(&KeyEvent::new(
             KeyCode::Char('n'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ));
-        assert_eq!(a, b);
-        assert_eq!(a, Chord::parse("ctrl+shift+n").unwrap());
+        assert_eq!(upper, shifted);
+        assert_eq!(upper, Chord::parse("ctrl+shift+n")?);
+        Ok(())
     }
 
     #[test]
-    fn parses_function_keys() {
-        assert_eq!(Chord::parse("alt+f7").unwrap().code, KeyCode::F(7));
+    fn parses_function_keys() -> Result<(), String> {
+        assert_eq!(Chord::parse("alt+f7")?.code, KeyCode::F(7));
+        Ok(())
     }
 }

@@ -16,6 +16,10 @@ use karet_search::SearchQuery;
 use crate::doc::Doc;
 
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent search toggles read directly by the view; grouping them would change pub fields"
+)]
 pub struct Find {
     pub query: String,
     /// The replacement text, when the replace field is shown.
@@ -44,27 +48,31 @@ pub enum Outcome {
 
 impl Find {
     pub fn open(doc: &Doc, replace: bool, previous: Option<&Find>) -> Self {
-        let mut f = Self {
+        let mut find = Self {
             origin: doc.caret(),
             ..Default::default()
         };
-        if let Some(p) = previous {
-            f.query.clone_from(&p.query);
-            f.case = p.case;
-            f.word = p.word;
-            f.regex = p.regex;
+        if let Some(prev) = previous {
+            find.query.clone_from(&prev.query);
+            find.case = prev.case;
+            find.word = prev.word;
+            find.regex = prev.regex;
         }
         // A single-line selection seeds the query, as in PyCharm.
-        if let Some(sel) = doc.selected_text().filter(|t| !t.contains('\n')) {
-            f.query = sel;
-            if let Some(r) = doc.state.selection_range() {
-                f.origin = r.start;
+        if let Some(sel) = doc.selected_text().filter(|text| !text.contains('\n')) {
+            find.query = sel;
+            if let Some(range) = doc.state.selection_range() {
+                find.origin = range.start;
             }
         }
         if replace {
-            f.replace = Some(previous.and_then(|p| p.replace.clone()).unwrap_or_default());
+            find.replace = Some(
+                previous
+                    .and_then(|prev| prev.replace.clone())
+                    .unwrap_or_default(),
+            );
         }
-        f
+        find
     }
 
     /// Recompute matches for the current query and buffer.
@@ -91,18 +99,18 @@ impl Find {
         self.matches = matcher
             .find(&text)
             .into_iter()
-            .filter(|m| m.end > m.start)
+            .filter(|found| found.end > found.start)
             .take(100_000)
-            .map(|m| Range {
-                start: doc.buffer.byte_to_line_col(BytePos(m.start)),
-                end: doc.buffer.byte_to_line_col(BytePos(m.end)),
+            .map(|found| Range {
+                start: doc.buffer.byte_to_line_col(BytePos(found.start)),
+                end: doc.buffer.byte_to_line_col(BytePos(found.end)),
             })
             .collect();
         let origin = (self.origin.line, self.origin.col);
         self.current = self
             .matches
             .iter()
-            .position(|r| (r.start.line, r.start.col) >= origin)
+            .position(|range| (range.start.line, range.start.col) >= origin)
             .or(if self.matches.is_empty() {
                 None
             } else {
@@ -112,9 +120,9 @@ impl Find {
 
     /// Select the current match in the editor.
     pub fn show(&self, doc: &mut Doc) {
-        if let Some(r) = self.current.and_then(|i| self.matches.get(i)) {
-            doc.goto(r.start);
-            doc.state.set_selection(&doc.buffer, r.start, r.end);
+        if let Some(range) = self.current.and_then(|idx| self.matches.get(idx)) {
+            doc.goto(range.start);
+            doc.state.set_selection(&doc.buffer, range.start, range.end);
         }
     }
 
@@ -122,14 +130,14 @@ impl Find {
         if self.matches.is_empty() {
             return;
         }
-        let n = self.matches.len();
+        let count = self.matches.len();
         self.current = Some(match self.current {
-            Some(i) if forward => (i + 1) % n,
-            Some(i) => (i + n - 1) % n,
+            Some(idx) if forward => (idx + 1) % count,
+            Some(idx) => (idx + count - 1) % count,
             None => 0,
         });
-        if let Some(r) = self.current.and_then(|i| self.matches.get(i)) {
-            self.origin = r.start;
+        if let Some(range) = self.current.and_then(|idx| self.matches.get(idx)) {
+            self.origin = range.start;
         }
         self.show(doc);
     }
@@ -141,18 +149,22 @@ impl Find {
         if self.matches.is_empty() {
             return false;
         }
-        let sel = doc.state.selection_range().filter(|r| !r.is_empty());
-        let (from, to) = sel.map_or((doc.caret(), doc.caret()), |r| (r.start, r.end));
-        let key = |p: LineCol| (p.line, p.col);
+        let sel = doc
+            .state
+            .selection_range()
+            .filter(|range| !range.is_empty());
+        let (sel_start, sel_end) =
+            sel.map_or((doc.caret(), doc.caret()), |range| (range.start, range.end));
+        let key = |pos: LineCol| (pos.line, pos.col);
         self.current = if forward {
             self.matches
                 .iter()
-                .position(|r| key(r.start) >= key(to))
+                .position(|range| key(range.start) >= key(sel_end))
                 .or(Some(0))
         } else {
             self.matches
                 .iter()
-                .rposition(|r| key(r.start) < key(from))
+                .rposition(|range| key(range.start) < key(sel_start))
                 .or(Some(self.matches.len() - 1))
         };
         self.show(doc);
@@ -160,17 +172,18 @@ impl Find {
     }
 
     fn replace_current(&mut self, doc: &mut Doc) {
-        let (Some(i), Some(with)) = (self.current, self.replace.clone()) else {
+        let (Some(idx), Some(with)) = (self.current, self.replace.clone()) else {
             return;
         };
-        let Some(r) = self.matches.get(i).copied() else {
+        let Some(range) = self.matches.get(idx).copied() else {
             return;
         };
         // Continue after the replacement, not on it.
-        let mut after = r.start;
-        after.col += with.chars().count() as u32;
+        let mut after = range.start;
+        let added = u32::try_from(with.chars().count()).unwrap_or(u32::MAX);
+        after.col = after.col.saturating_add(added);
         doc.apply_edits(vec![TextEdit {
-            range: r,
+            range,
             new_text: with,
         }]);
         self.origin = after;
@@ -185,17 +198,17 @@ impl Find {
         let edits: Vec<TextEdit> = self
             .matches
             .iter()
-            .map(|r| TextEdit {
-                range: *r,
+            .map(|range| TextEdit {
+                range: *range,
                 new_text: with.clone(),
             })
             .collect();
-        let n = edits.len();
-        if n > 0 {
+        let count = edits.len();
+        if count > 0 {
             doc.apply_edits(edits);
         }
         self.search(doc);
-        n
+        count
     }
 
     /// Handle a key while the bar is open. `status` receives a message.
@@ -208,11 +221,11 @@ impl Find {
             KeyCode::Esc => return Outcome::Close,
             KeyCode::Enter if self.in_replace => self.replace_current(doc),
             KeyCode::Enter | KeyCode::Down => {
-                self.step(doc, !(shift && key.code == KeyCode::Enter))
+                self.step(doc, !(shift && key.code == KeyCode::Enter));
             }
             KeyCode::Up => self.step(doc, false),
             KeyCode::Tab | KeyCode::BackTab if self.replace.is_some() => {
-                self.in_replace = !self.in_replace
+                self.in_replace = !self.in_replace;
             }
             KeyCode::Char('c') if alt => {
                 self.case = !self.case;
@@ -227,8 +240,8 @@ impl Find {
                 research = true;
             }
             KeyCode::Char('a') if alt && self.replace.is_some() => {
-                let n = self.replace_all(doc);
-                *status = format!("Replaced {n} occurrence(s)");
+                let count = self.replace_all(doc);
+                *status = format!("Replaced {count} occurrence(s)");
             }
             KeyCode::Backspace => {
                 self.field().pop();
@@ -238,8 +251,8 @@ impl Find {
                 self.field().clear();
                 research = !self.in_replace;
             }
-            KeyCode::Char(c) if !ctrl && !alt => {
-                self.field().push(c);
+            KeyCode::Char(chr) if !ctrl && !alt => {
+                self.field().push(chr);
                 research = !self.in_replace;
             }
             _ => return Outcome::Ignored,
@@ -253,7 +266,7 @@ impl Find {
 
     fn field(&mut self) -> &mut String {
         match (&mut self.replace, self.in_replace) {
-            (Some(r), true) => r,
+            (Some(text), true) => text,
             _ => &mut self.query,
         }
     }
@@ -272,13 +285,13 @@ impl Find {
         self.matches
             .iter()
             .enumerate()
-            .map(|(i, r)| {
-                let role = if Some(i) == self.current {
+            .map(|(idx, range)| {
+                let role = if Some(idx) == self.current {
                     ThemeRole::SearchMatchCurrent
                 } else {
                     ThemeRole::SearchMatch
                 };
-                Decoration::new(*r, DecorationKind::TextBackground, Some(role))
+                Decoration::new(*range, DecorationKind::TextBackground, Some(role))
             })
             .collect()
     }

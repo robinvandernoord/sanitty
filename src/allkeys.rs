@@ -33,7 +33,7 @@ impl AllKeys {
     pub fn new(key_for: impl Fn(Action) -> String) -> Self {
         let rows = Action::ALL
             .iter()
-            .map(|(a, label, group)| (*a, *label, *group, key_for(*a)))
+            .map(|(action, label, group)| (*action, *label, *group, key_for(*action)))
             .collect();
         Self {
             rows,
@@ -43,38 +43,44 @@ impl AllKeys {
     }
 
     fn visible(&self) -> Vec<usize> {
-        let q = self.query.to_lowercase();
-        (0..self.rows.len())
-            .filter(|i| {
-                let (_, label, group, key) = &self.rows[*i];
-                q.is_empty()
-                    || label.to_lowercase().contains(&q)
-                    || key.to_lowercase().contains(&q)
-                    || group.to_lowercase().contains(&q)
+        let needle = self.query.to_lowercase();
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, label, group, key))| {
+                needle.is_empty()
+                    || label.to_lowercase().contains(&needle)
+                    || key.to_lowercase().contains(&needle)
+                    || group.to_lowercase().contains(&needle)
             })
+            .map(|(idx, _)| idx)
             .collect()
     }
 
     pub fn handle_key(&mut self, key: &KeyEvent) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let n = self.visible().len();
+        let count = self.visible().len();
         match key.code {
             KeyCode::Esc => return Outcome::Close,
             KeyCode::Enter => {
-                if let Some(i) = self.visible().get(self.selected) {
-                    return Outcome::Run(self.rows[*i].0);
+                if let Some((action, ..)) = self
+                    .visible()
+                    .get(self.selected)
+                    .and_then(|idx| self.rows.get(*idx))
+                {
+                    return Outcome::Run(*action);
                 }
             }
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = (self.selected + 1).min(n.saturating_sub(1)),
+            KeyCode::Down => self.selected = (self.selected + 1).min(count.saturating_sub(1)),
             KeyCode::PageUp => self.selected = self.selected.saturating_sub(10),
-            KeyCode::PageDown => self.selected = (self.selected + 10).min(n.saturating_sub(1)),
+            KeyCode::PageDown => self.selected = (self.selected + 10).min(count.saturating_sub(1)),
             KeyCode::Backspace => {
                 self.query.pop();
                 self.selected = 0;
             }
-            KeyCode::Char(c) if !ctrl => {
-                self.query.push(c);
+            KeyCode::Char(chr) if !ctrl => {
+                self.query.push(chr);
                 self.selected = 0;
             }
             _ => {}
@@ -82,17 +88,17 @@ impl AllKeys {
         Outcome::Pending
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect, theme: &karet_theme::Theme) {
-        let w = 72.min(area.width);
-        let h = (area.height * 8 / 10).max(10.min(area.height));
+    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &karet_theme::Theme) {
+        let width = 72.min(area.width);
+        let height = (area.height * 8 / 10).max(10.min(area.height));
         let rect = Rect {
-            x: area.x + (area.width - w) / 2,
-            y: area.y + area.height.saturating_sub(h) / 2,
-            width: w,
-            height: h,
+            x: area.x + (area.width - width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
         };
-        f.render_widget(Clear, rect);
-        let base = crate::ui::surface(theme);
+        frame.render_widget(Clear, rect);
+        let base = crate::styles::surface(theme);
         let muted = theme.style(karet_core::ThemeRole::Muted);
         let accent = theme
             .token_style(karet_core::TokenId::FUNCTION)
@@ -102,29 +108,36 @@ impl AllKeys {
             .title(" All Keys ")
             .style(base);
         let inner = block.inner(rect);
-        f.render_widget(block, rect);
-        f.render_widget(
+        frame.render_widget(block, rect);
+        frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("> ", accent),
                 Span::raw(self.query.as_str()),
             ])),
             Rect { height: 1, ..inner },
         );
-        f.set_cursor_position((inner.x + 2 + self.query.chars().count() as u16, inner.y));
+        let query_width = u16::try_from(self.query.chars().count()).unwrap_or(u16::MAX);
+        frame.set_cursor_position((
+            inner.x.saturating_add(2).saturating_add(query_width),
+            inner.y,
+        ));
 
         // Group headers interleaved with rows; scroll so the selection shows.
         let mut lines: Vec<(Line, bool)> = Vec::new();
         let mut group = "";
-        for (n, i) in self.visible().into_iter().enumerate() {
-            let (_, label, g, key) = &self.rows[i];
-            if *g != group {
-                group = g;
+        let visible_rows = self
+            .visible()
+            .into_iter()
+            .filter_map(|idx| self.rows.get(idx));
+        for (pos, (_, label, row_group, key)) in visible_rows.enumerate() {
+            if *row_group != group {
+                group = row_group;
                 lines.push((
-                    Line::styled(format!(" {g}"), base.add_modifier(Modifier::BOLD)),
+                    Line::styled(format!(" {row_group}"), base.add_modifier(Modifier::BOLD)),
                     false,
                 ));
             }
-            let style = if n == self.selected {
+            let style = if pos == self.selected {
                 base.add_modifier(Modifier::REVERSED)
             } else {
                 base
@@ -133,11 +146,11 @@ impl AllKeys {
                 Line::from(vec![
                     Span::styled(
                         format!("   {key:>20}  "),
-                        if n == self.selected { style } else { muted },
+                        if pos == self.selected { style } else { muted },
                     ),
                     Span::styled(format!("{label:<44}"), style),
                 ]),
-                n == self.selected,
+                pos == self.selected,
             ));
         }
         let body = Rect {
@@ -145,9 +158,12 @@ impl AllKeys {
             height: inner.height.saturating_sub(1),
             ..inner
         };
-        let sel_line = lines.iter().position(|(_, s)| *s).unwrap_or(0);
+        let sel_line = lines
+            .iter()
+            .position(|(_, is_selected)| *is_selected)
+            .unwrap_or(0);
         let skip = sel_line.saturating_sub(body.height as usize * 2 / 3);
-        let shown: Vec<Line> = lines.into_iter().skip(skip).map(|(l, _)| l).collect();
-        f.render_widget(Paragraph::new(shown), body);
+        let shown: Vec<Line> = lines.into_iter().skip(skip).map(|(line, _)| line).collect();
+        frame.render_widget(Paragraph::new(shown), body);
     }
 }

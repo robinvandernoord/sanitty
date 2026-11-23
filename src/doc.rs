@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use karet_core::AppliedEdit;
 use karet_core::Change;
 use karet_core::Diagnostic;
 use karet_core::EditCause;
@@ -15,10 +16,10 @@ use karet_core::TextEdit;
 use karet_editor::EditorState;
 use karet_editor::editing;
 use karet_editor::editing::Edit;
-use karet_syntax::Highlighter;
 use karet_syntax::LanguageId;
-use karet_syntax::ParserPool;
-use karet_syntax::SyntaxTree;
+use karet_syntax::LayeredHighlighter;
+use karet_syntax::LayeredParser;
+use karet_syntax::LayeredTree;
 use karet_text::EditContext;
 use karet_text::TextBuffer;
 
@@ -45,15 +46,17 @@ pub struct Doc {
     /// Set for CSV/TSV files, which get rainbow columns instead of tree-sitter.
     pub table: Option<crate::csv::Table>,
     lang: Option<LanguageId>,
-    highlighter: Option<Highlighter>,
-    pool: ParserPool,
+    /// The syntax tree of the current text, kept so an edit reparses only what
+    /// it touched: a full parse of a large file takes about a second.
+    tree: Option<LayeredTree>,
+    parser: LayeredParser,
+    highlighter: LayeredHighlighter,
 }
 
 impl Doc {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let buffer = TextBuffer::load(path)?;
         let lang = syntax_language(path);
-        let highlighter = lang.and_then(|l| Highlighter::new(l).ok());
         let mut doc = Self {
             path: path.to_path_buf(),
             lsp_synced: buffer.version(),
@@ -69,16 +72,27 @@ impl Doc {
             extra_colours: Vec::new(),
             table: crate::csv::is_table(path).then(Default::default),
             lang,
-            highlighter,
-            pool: ParserPool::new(),
+            tree: None,
+            parser: LayeredParser::new(),
+            highlighter: LayeredHighlighter::new(),
         };
-        doc.rehighlight();
+        doc.rehighlight(&[]);
         Ok(doc)
     }
 
-    /// Full reparse and re-highlight. Tree-sitter parses a few thousand lines in
-    /// well under a frame, so incremental parsing can wait until it matters.
-    fn rehighlight(&mut self) {
+    /// Recolour after `edits` (as the buffer reported them; empty for a fresh
+    /// start, which parses everything).
+    fn rehighlight(&mut self, edits: &[AppliedEdit]) {
+        let started = std::time::Instant::now();
+        self.rehighlight_inner(edits);
+        crate::debug_log(&format!(
+            "rehighlight {}: {:?}",
+            self.path.display(),
+            started.elapsed()
+        ));
+    }
+
+    fn rehighlight_inner(&mut self, edits: &[AppliedEdit]) {
         self.restyle();
         if let Some(table) = &self.table {
             let text = self.buffer.text();
@@ -93,17 +107,21 @@ impl Doc {
             self.diagnostics = table
                 .problems
                 .iter()
-                .map(|p| Diagnostic {
+                .map(|problem| Diagnostic {
                     range: Range {
-                        start: self.buffer.byte_to_line_col(karet_core::BytePos(p.start)),
-                        end: self.buffer.byte_to_line_col(karet_core::BytePos(p.end)),
+                        start: self
+                            .buffer
+                            .byte_to_line_col(karet_core::BytePos(problem.start)),
+                        end: self
+                            .buffer
+                            .byte_to_line_col(karet_core::BytePos(problem.end)),
                     },
-                    severity: if p.error {
+                    severity: if problem.error {
                         karet_core::Severity::Error
                     } else {
                         karet_core::Severity::Warning
                     },
-                    message: p.message.clone(),
+                    message: problem.message.clone(),
                     source: Some("csv".into()),
                     code: None,
                     code_href: None,
@@ -115,17 +133,33 @@ impl Doc {
             return;
         }
         if crate::tshl::handles(&self.path)
-            && let Some(h) = crate::tshl::highlight(&self.buffer.text(), &self.path)
+            && let Some(highlights) = crate::tshl::highlight(&self.buffer.text(), &self.path)
         {
-            self.highlights = Some(h);
+            self.highlights = Some(highlights);
             return;
         }
-        let (Some(lang), Some(hl)) = (self.lang, self.highlighter.as_ref()) else {
+        let Some(lang) = self.lang else {
             return;
         };
         let text = self.buffer.text();
-        if let Ok(tree) = SyntaxTree::parse(&mut self.pool, lang, &text) {
-            self.highlights = hl.highlight(&tree, &text).ok();
+        if let (Some(tree), Some(previous), false) = (
+            self.tree.as_mut(),
+            self.highlights.as_ref(),
+            edits.is_empty(),
+        ) && let Ok(changed) = self.parser.reparse_changed(tree, edits, &text)
+        {
+            self.highlights = Some(
+                self.highlighter
+                    .rehighlight(tree, &text, previous, edits, &changed),
+            );
+            return;
+        }
+        if let Ok(tree) = self.parser.parse(lang, &text) {
+            self.highlights = Some(self.highlighter.highlight(&tree, &text));
+            self.tree = Some(tree);
+        } else {
+            self.highlights = None;
+            self.tree = None;
         }
     }
 
@@ -164,22 +198,25 @@ impl Doc {
     fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            })
     }
 
     /// Apply an edit and move the caret where it says.
     pub fn apply(&mut self, edit: Edit, cause: EditCause) -> bool {
+        let Edit { change, caret } = edit;
         let ctx = EditContext {
             tick_ms: Self::now_ms(),
             cause,
             cursor_before: self.state.cursors().clone(),
         };
-        if self.buffer.apply(&edit.change, ctx).is_err() {
+        let Ok(applied) = self.buffer.apply(&change, ctx) else {
             return false;
-        }
-        self.state.place_caret(edit.caret);
-        self.state.reveal(&self.buffer, edit.caret);
-        self.rehighlight();
+        };
+        self.state.place_caret(caret);
+        self.state.reveal(&self.buffer, caret);
+        self.rehighlight(&applied.edits);
         true
     }
 
@@ -188,13 +225,13 @@ impl Doc {
     pub fn apply_edits(&mut self, edits: Vec<TextEdit>) -> bool {
         let change = Change::new(self.buffer.version(), edits);
         let caret = self.caret();
-        let ok = self.buffer.apply_simple(&change).is_ok();
-        if ok {
-            let c = self.buffer.clamp(caret);
-            self.state.place_caret(c);
-            self.rehighlight();
-        }
-        ok
+        let Ok(applied) = self.buffer.apply_simple(&change) else {
+            return false;
+        };
+        let clamped = self.buffer.clamp(caret);
+        self.state.place_caret(clamped);
+        self.rehighlight(&applied.edits);
+        true
     }
 
     pub fn type_text(&mut self, text: &str) {
@@ -219,37 +256,37 @@ impl Doc {
     }
 
     pub fn backspace(&mut self, word: bool) {
-        let (c, s, v) = (self.caret(), self.selection(), self.buffer.version());
+        let (caret, selection, version) = (self.caret(), self.selection(), self.buffer.version());
         let edit = if word {
-            editing::delete_word_backward(c, s, &self.buffer, v)
+            editing::delete_word_backward(caret, selection, &self.buffer, version)
         } else {
-            editing::backspace(c, s, &self.buffer, v)
+            editing::backspace(caret, selection, &self.buffer, version)
         };
-        if let Some(e) = edit {
-            self.apply(e, EditCause::Delete);
+        if let Some(edit) = edit {
+            self.apply(edit, EditCause::Delete);
         }
     }
 
     pub fn delete(&mut self, word: bool) {
-        let (c, s, v) = (self.caret(), self.selection(), self.buffer.version());
+        let (caret, selection, version) = (self.caret(), self.selection(), self.buffer.version());
         let edit = if word {
-            editing::delete_word_forward(c, s, &self.buffer, v)
+            editing::delete_word_forward(caret, selection, &self.buffer, version)
         } else {
-            editing::delete_forward(c, s, &self.buffer, v)
+            editing::delete_forward(caret, selection, &self.buffer, version)
         };
-        if let Some(e) = edit {
-            self.apply(e, EditCause::Delete);
+        if let Some(edit) = edit {
+            self.apply(edit, EditCause::Delete);
         }
     }
 
     fn line_len(&self, line: u32) -> u32 {
-        self.buffer.line(line as usize).map_or(0, |l| {
-            l.trim_end_matches(['\n', '\r']).chars().count() as u32
+        self.buffer.line(line as usize).map_or(0, |text| {
+            to_u32(text.trim_end_matches(['\n', '\r']).chars().count())
         })
     }
 
     pub fn duplicate_line(&mut self) {
-        if let Some(sel) = self.selection().filter(|r| !r.is_empty()) {
+        if let Some(sel) = self.selection().filter(|range| !range.is_empty()) {
             let text = self.buffer.slice_range(sel).unwrap_or_default();
             let edit = editing::insert(sel.end, None, self.buffer.version(), &text);
             self.apply(edit, EditCause::Replace);
@@ -271,7 +308,7 @@ impl Doc {
 
     pub fn delete_line(&mut self) {
         let caret = self.caret();
-        let last = self.buffer.line_count().saturating_sub(1) as u32;
+        let last = to_u32(self.buffer.line_count().saturating_sub(1));
         let range = if caret.line < last {
             Range {
                 start: LineCol::new(caret.line, 0),
@@ -292,7 +329,7 @@ impl Doc {
         let target_line = range
             .start
             .line
-            .min(self.buffer.line_count().saturating_sub(2) as u32);
+            .min(to_u32(self.buffer.line_count().saturating_sub(2)));
         edit.caret = LineCol::new(
             if caret.line < last {
                 caret.line
@@ -302,10 +339,10 @@ impl Doc {
             0,
         );
         self.apply(edit, EditCause::Delete);
-        let c = self
+        let clamped = self
             .buffer
             .clamp(LineCol::new(self.caret().line, caret.col));
-        self.state.place_caret(c);
+        self.state.place_caret(clamped);
     }
 
     pub fn toggle_comment(&mut self) {
@@ -313,36 +350,40 @@ impl Doc {
             return;
         };
         let caret = self.caret();
-        let (first, last) = match self.selection().filter(|r| !r.is_empty()) {
-            Some(r) => (
-                r.start.line,
-                if r.end.col == 0 && r.end.line > r.start.line {
-                    r.end.line - 1
+        let (first, last) = match self.selection().filter(|range| !range.is_empty()) {
+            Some(range) => (
+                range.start.line,
+                if range.end.col == 0 && range.end.line > range.start.line {
+                    range.end.line - 1
                 } else {
-                    r.end.line
+                    range.end.line
                 },
             ),
             None => (caret.line, caret.line),
         };
         let lines: Vec<String> = (first..=last)
-            .map(|l| self.buffer.line(l as usize).unwrap_or_default())
+            .map(|line| self.buffer.line(line as usize).unwrap_or_default())
             .collect();
         let all_commented = lines
             .iter()
-            .filter(|l| !l.trim().is_empty())
-            .all(|l| l.trim_start().starts_with(prefix));
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| line.trim_start().starts_with(prefix));
         let mut edits = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            let ln = first + i as u32;
-            let indent = line.chars().take_while(|c| *c == ' ' || *c == '\t').count() as u32;
+        for (line_no, line) in (first..).zip(lines.iter()) {
+            let indent = to_u32(
+                line.chars()
+                    .take_while(|chr| *chr == ' ' || *chr == '\t')
+                    .count(),
+            );
             if all_commented {
                 let rest: String = line.chars().skip(indent as usize).collect();
                 if let Some(after) = rest.strip_prefix(prefix) {
-                    let n = prefix.chars().count() as u32 + u32::from(after.starts_with(' '));
+                    let removed =
+                        to_u32(prefix.chars().count()) + u32::from(after.starts_with(' '));
                     edits.push(TextEdit {
                         range: Range {
-                            start: LineCol::new(ln, indent),
-                            end: LineCol::new(ln, indent + n),
+                            start: LineCol::new(line_no, indent),
+                            end: LineCol::new(line_no, indent + removed),
                         },
                         new_text: String::new(),
                     });
@@ -350,8 +391,8 @@ impl Doc {
             } else if !line.trim().is_empty() {
                 edits.push(TextEdit {
                     range: Range {
-                        start: LineCol::new(ln, indent),
-                        end: LineCol::new(ln, indent),
+                        start: LineCol::new(line_no, indent),
+                        end: LineCol::new(line_no, indent),
                     },
                     new_text: format!("{prefix} "),
                 });
@@ -371,43 +412,43 @@ impl Doc {
 
     pub fn undo(&mut self) {
         if let Some(applied) = self.buffer.undo() {
-            if let Some(cs) = applied.restored_cursor {
-                self.state.set_cursor_state(&self.buffer, cs);
+            if let Some(cursors) = applied.restored_cursor {
+                self.state.set_cursor_state(&self.buffer, cursors);
             }
-            let c = self.buffer.clamp(self.caret());
-            self.state.reveal(&self.buffer, c);
-            self.rehighlight();
+            let clamped = self.buffer.clamp(self.caret());
+            self.state.reveal(&self.buffer, clamped);
+            self.rehighlight(&applied.edits);
         }
     }
 
     pub fn redo(&mut self) {
         if let Some(applied) = self.buffer.redo() {
-            if let Some(cs) = applied.restored_cursor {
-                self.state.set_cursor_state(&self.buffer, cs);
+            if let Some(cursors) = applied.restored_cursor {
+                self.state.set_cursor_state(&self.buffer, cursors);
             }
-            let c = self.buffer.clamp(self.caret());
-            self.state.place_caret(c);
-            self.state.reveal(&self.buffer, c);
-            self.rehighlight();
+            let clamped = self.buffer.clamp(self.caret());
+            self.state.place_caret(clamped);
+            self.state.reveal(&self.buffer, clamped);
+            self.rehighlight(&applied.edits);
         }
     }
 
     pub fn selected_text(&self) -> Option<String> {
         self.selection()
-            .filter(|r| !r.is_empty())
-            .and_then(|r| self.buffer.slice_range(r))
+            .filter(|range| !range.is_empty())
+            .and_then(|range| self.buffer.slice_range(range))
     }
 
     /// The current line including its break, PyCharm-style copy without selection.
     pub fn current_line_text(&self) -> String {
-        let mut l = self
+        let mut line = self
             .buffer
             .line(self.caret().line as usize)
             .unwrap_or_default();
-        if !l.ends_with('\n') {
-            l.push('\n');
+        if !line.ends_with('\n') {
+            line.push('\n');
         }
-        l
+        line
     }
 
     pub fn cut(&mut self) -> String {
@@ -429,30 +470,30 @@ impl Doc {
     pub fn goto(&mut self, pos: LineCol) {
         let pos = self.buffer.clamp(pos);
         self.state.place_caret(pos);
-        if !line_visible(&self.state, pos.line) {
-            self.frame_line = Some(pos.line);
-        } else {
+        if line_visible(&self.state, pos.line) {
             self.state.reveal(&self.buffer, pos);
+        } else {
+            self.frame_line = Some(pos.line);
         }
     }
 
     /// The identifier under the caret, for rename prefill.
     pub fn word_at_caret(&self) -> Option<String> {
-        let (a, b) = karet_text::words::identifier_at(&self.buffer, self.caret())?;
-        self.buffer.slice_range(Range { start: a, end: b })
+        let (start, end) = karet_text::words::identifier_at(&self.buffer, self.caret())?;
+        self.buffer.slice_range(Range { start, end })
     }
 
     /// Caret converted to the UTF-16 columns LSP speaks.
     /// The table column under the caret, as a status-line label.
     pub fn table_column(&self) -> Option<String> {
         let table = self.table.as_ref()?;
-        let c = self.caret();
-        let line = self.buffer.line(c.line as usize)?;
+        let caret = self.caret();
+        let line = self.buffer.line(caret.line as usize)?;
         let byte = line
             .char_indices()
-            .nth(c.col as usize)
-            .map_or(line.len(), |(b, _)| b);
-        Some(table.describe(table.column_at(c.line as usize, &line, byte)))
+            .nth(caret.col as usize)
+            .map_or(line.len(), |(offset, _)| offset);
+        Some(table.describe(table.column_at(caret.line as usize, &line, byte)))
     }
 
     /// Take diagnostics in LSP's UTF-16 columns.
@@ -460,22 +501,24 @@ impl Doc {
         self.diagnostics = diags
             .iter()
             .cloned()
-            .map(|mut d| {
-                d.range = self.range_from_utf16(d.range);
-                d
+            .map(|mut diagnostic| {
+                diagnostic.range = self.range_from_utf16(diagnostic.range);
+                diagnostic
             })
             .collect();
     }
 
     pub fn caret_utf16(&self) -> LineCol {
-        let c = self.caret();
-        LineCol::new(c.line, self.buffer.line_col_to_utf16(c))
+        let caret = self.caret();
+        LineCol::new(caret.line, self.buffer.line_col_to_utf16(caret))
     }
 
-    pub fn range_from_utf16(&self, r: Range) -> Range {
+    pub fn range_from_utf16(&self, range: Range) -> Range {
         Range {
-            start: self.buffer.utf16_to_line_col(r.start.line, r.start.col),
-            end: self.buffer.utf16_to_line_col(r.end.line, r.end.col),
+            start: self
+                .buffer
+                .utf16_to_line_col(range.start.line, range.start.col),
+            end: self.buffer.utf16_to_line_col(range.end.line, range.end.col),
         }
     }
 }
@@ -484,7 +527,7 @@ impl Doc {
 /// their own highlight rules in karet colour almost nothing, while the CSS
 /// grammar handles the CSS that most of their lines are.
 fn syntax_language(path: &Path) -> Option<LanguageId> {
-    match path.extension().and_then(|e| e.to_str()) {
+    match path.extension().and_then(|ext| ext.to_str()) {
         Some("scss" | "less") => karet_syntax::language_id_from_path(Path::new("x.css")),
         _ => karet_syntax::language_id_from_path(path),
     }
@@ -515,6 +558,50 @@ fn comment_prefix(path: &Path) -> Option<&'static str> {
 }
 
 fn line_visible(state: &EditorState, line: u32) -> bool {
-    let v = state.viewport();
-    v.start.line < v.end.line && v.start.line <= line && line < v.end.line
+    let view = state.viewport();
+    view.start.line < view.end.line && view.start.line <= line && line < view.end.line
+}
+
+/// A count as a `u32` column or line number, saturating for absurd sizes.
+fn to_u32(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Incremental recolouring after edits (and their undo) must match what a
+    /// fresh parse of the same text gives.
+    #[test]
+    fn incremental_highlights_match_a_fresh_parse() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("sanitty-doc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("a.py");
+        std::fs::write(
+            &path,
+            "def f(x):\n    \"\"\"Doc.\"\"\"\n    return x + 1\n\nclass A:\n    pass\n",
+        )?;
+        let mut doc = Doc::open(&path)?;
+        doc.goto(LineCol::new(2, 4));
+        doc.type_text("y = \"open");
+        doc.goto(LineCol::new(5, 8));
+        doc.type_text("\n    def g(self): return 2");
+        doc.backspace(false);
+        doc.undo();
+
+        let fresh_path = dir.join("b.py");
+        std::fs::write(&fresh_path, doc.buffer.text())?;
+        let fresh = Doc::open(&fresh_path)?;
+        let spans = |opened: &Doc| {
+            opened
+                .highlights
+                .as_ref()
+                .map(|highlights| highlights.all().to_vec())
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        let incremental = spans(&doc).ok_or("no highlights after edits")?;
+        assert_eq!(Some(incremental), spans(&fresh));
+        Ok(())
+    }
 }

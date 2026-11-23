@@ -3,6 +3,7 @@
 mod allkeys;
 mod app;
 mod colors;
+mod complete;
 mod csv;
 mod doc;
 mod explorer;
@@ -15,8 +16,8 @@ mod picker;
 mod search;
 mod sig;
 mod stylenav;
+mod styles;
 mod tshl;
-mod ui;
 
 use std::io::Write;
 use std::path::Path;
@@ -46,12 +47,22 @@ pub enum Event {
     Status(String),
     LspReady(&'static str, Arc<LspClient>),
     LspFailed(&'static str, String),
-    Diagnostics(PathBuf, Vec<Diagnostic>),
+    /// Problems for a file from one server (its key), replacing that server's last report.
+    Diagnostics(&'static str, PathBuf, Vec<Diagnostic>),
     Locations(lsp::Nav, Vec<Location>),
     Rename(lsp::Edit),
+    /// Formatting edits (UTF-16 columns) for a file, computed against the
+    /// buffer version given.
+    Formatted(PathBuf, u64, Vec<karet_core::TextEdit>),
     /// A hover answer: file, caret position (chars), text, and whether it was
     /// asked for as a popup (Alt+H) rather than for the status line.
     Hover(PathBuf, karet_core::LineCol, Option<String>, bool),
+    /// Completion candidates for the request with this generation, or why
+    /// there are none.
+    Completions(u64, Result<karet_core::CompletionList, String>),
+    /// A completion item filled in (docs, imports): generation, its index in
+    /// the list, and the server's answer (`None` if it had nothing).
+    CompletionResolved(u64, usize, Option<Box<karet_core::CompletionItem>>),
     /// Semantic tokens for a file at an LSP document version (UTF-16 columns).
     Semantic(PathBuf, i32, Vec<karet_core::SemanticToken>),
     /// Async launcher results: search generation, kind, items.
@@ -63,18 +74,19 @@ pub enum Event {
 /// language-server trouble without disturbing the screen.
 pub fn debug_log(line: &str) {
     if let Some(path) = std::env::var_os("SANITTY_LOG")
-        && let Ok(mut f) = std::fs::OpenOptions::new()
+        && let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
     {
-        let _ = writeln!(f, "{line}");
+        let _ = writeln!(file, "{line}");
     }
 }
 
 /// `$XDG_CONFIG_HOME/sanitty`.
+#[must_use]
 pub fn config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("sanitty"))
+    dirs::config_dir().map(|dir| dir.join("sanitty"))
 }
 
 /// Copy to the system clipboard through the terminal (OSC 52), which works over
@@ -84,14 +96,16 @@ pub fn osc52_copy(text: &str) {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(B64[((n >> (18 - 6 * i)) & 63) as usize] as char);
-            } else {
-                out.push('=');
+        let byte_at = |idx: usize| u32::from(chunk.get(idx).copied().unwrap_or(0));
+        let triple = (byte_at(0) << 16) | (byte_at(1) << 8) | byte_at(2);
+        // Four 6-bit groups, high to low; a short chunk pads the missing ones.
+        for (pos, shift) in [18_u32, 12, 6, 0].into_iter().enumerate() {
+            let digit = usize::try_from((triple >> shift) & 63)
+                .ok()
+                .and_then(|sextet| B64.get(sextet));
+            match digit {
+                Some(&digit) if pos <= chunk.len() => out.push(char::from(digit)),
+                _ => out.push('='),
             }
         }
     }
@@ -107,13 +121,13 @@ fn workspace_root(path: &Path) -> PathBuf {
         path
     } else {
         path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
+            .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."))
     };
     let dir = dir.to_path_buf();
     let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     dir.ancestors()
-        .find(|a| a.join(".git").exists())
+        .find(|ancestor| ancestor.join(".git").exists())
         .map_or(dir.clone(), Path::to_path_buf)
 }
 
@@ -135,18 +149,24 @@ pub const SKIP_DIRS: &[&str] = &[
 
 fn index_files(root: PathBuf, tx: mpsc::UnboundedSender<Event>) {
     std::thread::spawn(move || {
+        let started = std::time::Instant::now();
         let files: Vec<PathBuf> = ignore::WalkBuilder::new(&root)
             .hidden(false)
-            .filter_entry(|e| {
-                !(e.file_type().is_some_and(|t| t.is_dir())
-                    && SKIP_DIRS.iter().any(|d| e.file_name() == *d))
+            .filter_entry(|entry| {
+                !(entry.file_type().is_some_and(|kind| kind.is_dir())
+                    && SKIP_DIRS.iter().any(|skip| entry.file_name() == *skip))
             })
             .build()
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
             .map(ignore::DirEntry::into_path)
             .take(200_000)
             .collect();
+        debug_log(&format!(
+            "index: {} files in {:?}",
+            files.len(),
+            started.elapsed()
+        ));
         let _ = tx.send(Event::Files(files));
     });
 }
@@ -162,8 +182,8 @@ fn spawn_input(tx: mpsc::UnboundedSender<Event>, paused: Arc<AtomicBool>) {
             }
             match event::poll(Duration::from_millis(30)) {
                 Ok(true) => {
-                    if let Ok(ev) = event::read()
-                        && tx.send(Event::Term(ev)).is_err()
+                    if let Ok(term_event) = event::read()
+                        && tx.send(Event::Term(term_event)).is_err()
                     {
                         return;
                     }
@@ -221,11 +241,11 @@ fn run_shell(root: &Path, enhanced: bool, paused: &AtomicBool) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // `--check-keys` starts in Check Keys, for terminals that swallow Ctrl+K.
-    let check_keys = std::env::args().any(|a| a == "--check-keys");
+    // `--check-keys` starts in Check Keys, for terminals that swallow the launcher key.
+    let check_keys = std::env::args().any(|arg| arg == "--check-keys");
     let arg = std::env::args()
         .skip(1)
-        .find(|a| !a.starts_with("--"))
+        .find(|arg| !arg.starts_with("--"))
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
     let root = workspace_root(&arg);
 
@@ -262,9 +282,9 @@ async fn main() -> anyhow::Result<()> {
     spawn_input(tx.clone(), paused.clone());
     let tick_tx = tx.clone();
     tokio::spawn(async move {
-        let mut iv = tokio::time::interval(Duration::from_millis(300));
+        let mut ticker = tokio::time::interval(Duration::from_millis(300));
         loop {
-            iv.tick().await;
+            ticker.tick().await;
             if tick_tx.send(Event::Tick).is_err() {
                 break;
             }
@@ -273,12 +293,14 @@ async fn main() -> anyhow::Result<()> {
 
     let result: anyhow::Result<()> = async {
         loop {
-            term.draw(|f| app.render(f))?;
-            let Some(ev) = rx.recv().await else { break };
-            app.handle(ev);
+            term.draw(|frame| app.render(frame))?;
+            let Some(incoming) = rx.recv().await else {
+                break;
+            };
+            app.handle(incoming);
             // Drain whatever else is queued before redrawing (fast typing, pastes).
-            while let Ok(ev) = rx.try_recv() {
-                app.handle(ev);
+            while let Ok(queued) = rx.try_recv() {
+                app.handle(queued);
             }
             if app.shell_requested {
                 app.shell_requested = false;

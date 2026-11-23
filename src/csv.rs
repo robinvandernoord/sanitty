@@ -33,7 +33,7 @@ const SEPARATOR: StandardToken = StandardToken::Comment;
 pub fn is_table(path: &Path) -> bool {
     matches!(
         path.extension()
-            .and_then(|e| e.to_str())
+            .and_then(|ext| ext.to_str())
             .map(str::to_ascii_lowercase)
             .as_deref(),
         Some("csv" | "tsv" | "psv")
@@ -65,24 +65,21 @@ impl Table {
     /// The zero-based column at `byte` within `line`, whose text is `text`.
     pub fn column_at(&self, line: usize, text: &str, byte: usize) -> u32 {
         let (mut quoted, mut col) = self.line_start.get(line).copied().unwrap_or((false, 0));
-        let bytes = text.as_bytes();
-        let mut i = 0;
-        while i < byte.min(bytes.len()) {
-            let b = bytes[i];
+        let mut bytes = text.as_bytes().iter().enumerate().peekable();
+        while let Some((idx, &chr)) = bytes.next() {
+            if idx >= byte {
+                break;
+            }
             if quoted {
-                if b == b'"' {
-                    if bytes.get(i + 1) == Some(&b'"') {
-                        i += 1;
-                    } else {
-                        quoted = false;
-                    }
+                // A doubled quote is an escaped quote and keeps the field open.
+                if chr == b'"' && bytes.next_if(|&(_, &next)| next == b'"').is_none() {
+                    quoted = false;
                 }
-            } else if b == b'"' {
+            } else if chr == b'"' {
                 quoted = true;
-            } else if b == self.separator {
+            } else if chr == self.separator {
                 col += 1;
             }
-            i += 1;
         }
         col
     }
@@ -92,8 +89,8 @@ impl Table {
         match self
             .header
             .get(col as usize)
-            .map(|h| h.trim())
-            .filter(|h| !h.is_empty())
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
         {
             Some(name) => format!("col {}: {name}", col + 1),
             None if col as usize >= self.header.len() => format!("col {} (no header)", col + 1),
@@ -108,7 +105,7 @@ impl Table {
 pub fn detect_separator(path: &Path, text: &str) -> u8 {
     match path
         .extension()
-        .and_then(|e| e.to_str())
+        .and_then(|ext| ext.to_str())
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
@@ -116,12 +113,19 @@ pub fn detect_separator(path: &Path, text: &str) -> u8 {
         Some("psv") => return b'|',
         _ => {}
     }
-    let sample: Vec<&str> = text.lines().filter(|l| !l.is_empty()).take(20).collect();
+    let sample: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .take(20)
+        .collect();
     let mut best = (b',', 0usize, false);
     for sep in *b",;\t|" {
-        let counts: Vec<usize> = sample.iter().map(|l| count_unquoted(l, sep)).collect();
+        let counts: Vec<usize> = sample
+            .iter()
+            .map(|line| count_unquoted(line, sep))
+            .collect();
         let first = counts.first().copied().unwrap_or(0);
-        let consistent = first > 0 && counts.iter().all(|c| *c == first);
+        let consistent = first > 0 && counts.iter().all(|count| *count == first);
         // Consistency beats frequency; then more separators per line wins.
         if (consistent, first) > (best.2, best.1) {
             best = (sep, first, consistent);
@@ -133,11 +137,11 @@ pub fn detect_separator(path: &Path, text: &str) -> u8 {
 fn count_unquoted(line: &str, sep: u8) -> usize {
     let mut quoted = false;
     line.bytes()
-        .filter(|b| {
-            if *b == b'"' {
+        .filter(|chr| {
+            if *chr == b'"' {
                 quoted = !quoted;
             }
-            !quoted && *b == sep
+            !quoted && *chr == sep
         })
         .count()
 }
@@ -161,50 +165,52 @@ pub fn highlight(text: &str, separator: u8) -> (Highlights, Table) {
     let mut record_start = 0;
     let mut extra_start: Option<usize> = None;
     let mut quote_start = 0;
-    let push = |spans: &mut Vec<HighlightSpan>, a: usize, b: usize, token: TokenId| {
-        if b > a {
+    let push = |spans: &mut Vec<HighlightSpan>, from: usize, until: usize, token: TokenId| {
+        if until > from {
             spans.push(HighlightSpan {
-                span: Span::new(BytePos(a), BytePos(b)),
+                span: Span::new(BytePos(from), BytePos(until)),
                 token,
             });
         }
     };
-    let colour = |col: u32| PALETTE[col as usize % PALETTE.len()].id();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
+    let colour = |col: u32| {
+        PALETTE
+            .get(col as usize % PALETTE.len())
+            .copied()
+            .unwrap_or(StandardToken::String)
+            .id()
+    };
+    let mut iter = bytes.iter().enumerate().peekable();
+    while let Some((idx, &chr)) = iter.next() {
         if quoted {
-            if b == b'"' {
-                if bytes.get(i + 1) == Some(&b'"') {
-                    i += 1;
-                } else {
+            if chr == b'"' {
+                if iter.next_if(|&(_, &next)| next == b'"').is_none() {
                     quoted = false;
                 }
-            } else if b == b'\n' {
+            } else if chr == b'\n' {
                 // A line break inside quotes: close the span on this line so it
                 // never covers a newline, and resume on the next one.
-                push(&mut spans, start, i, colour(col));
-                start = i + 1;
+                push(&mut spans, start, idx, colour(col));
+                start = idx + 1;
                 table.line_start.push((true, col));
             }
-            i += 1;
             continue;
         }
-        if b == b'"' {
+        if chr == b'"' {
             quoted = true;
-            quote_start = i;
-        } else if b == separator || b == b'\n' {
-            let end = if b == b'\n' && i > start && bytes[i - 1] == b'\r' {
-                i - 1
+            quote_start = idx;
+        } else if chr == separator || chr == b'\n' {
+            let end = if chr == b'\n' && idx > start && bytes.get(idx - 1) == Some(&b'\r') {
+                idx - 1
             } else {
-                i
+                idx
             };
             push(&mut spans, start, end, colour(col));
-            if b == separator {
-                push(&mut spans, i, i + 1, SEPARATOR.id());
+            if chr == separator {
+                push(&mut spans, idx, idx + 1, SEPARATOR.id());
                 col += 1;
                 if col as usize == width {
-                    extra_start = Some(i + 1);
+                    extra_start = Some(idx + 1);
                 }
             } else {
                 check_record(
@@ -217,12 +223,11 @@ pub fn highlight(text: &str, separator: u8) -> (Highlights, Table) {
                 );
                 col = 0;
                 extra_start = None;
-                record_start = i + 1;
+                record_start = idx + 1;
                 table.line_start.push((false, 0));
             }
-            start = i + 1;
+            start = idx + 1;
         }
-        i += 1;
     }
     push(&mut spans, start, bytes.len(), colour(col));
     if quoted {
@@ -260,13 +265,13 @@ fn check_record(
         return; // a blank line
     }
     if fields > width {
-        let n = fields - width;
+        let extra = fields - width;
         problems.push(Problem {
             start: extra_start.unwrap_or(start),
             end,
             message: format!(
-                "{n} more {} than the header ({fields} instead of {width})",
-                if n == 1 { "field" } else { "fields" }
+                "{extra} more {} than the header ({fields} instead of {width})",
+                if extra == 1 { "field" } else { "fields" }
             ),
             error: false,
         });
@@ -290,8 +295,8 @@ fn parse_header(text: &str, separator: u8) -> Vec<String> {
     let mut field = String::new();
     let mut quoted = false;
     let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
+    while let Some(chr) = chars.next() {
+        match chr {
             '"' if quoted && chars.peek() == Some(&'"') => {
                 chars.next();
                 field.push('"');
@@ -299,8 +304,8 @@ fn parse_header(text: &str, separator: u8) -> Vec<String> {
             '"' => quoted = !quoted,
             '\n' if !quoted => break,
             '\r' if !quoted => {}
-            c if c == sep && !quoted => fields.push(std::mem::take(&mut field)),
-            c => field.push(c),
+            other if other == sep && !quoted => fields.push(std::mem::take(&mut field)),
+            other => field.push(other),
         }
     }
     fields.push(field);
@@ -318,13 +323,14 @@ mod tests {
     }
 
     #[test]
-    fn quoted_separator_stays_in_column() {
+    fn quoted_separator_stays_in_column() -> Result<(), Box<dyn std::error::Error>> {
         let text = "naam,status,route\nAnglia,\"Aangeschreven, geen reactie\",Onbekend\n";
         let (_, table) = highlight(text, b',');
         assert_eq!(table.header, ["naam", "status", "route"]);
         let line = "Anglia,\"Aangeschreven, geen reactie\",Onbekend";
-        let byte = line.find("Onbekend").unwrap();
+        let byte = line.find("Onbekend").ok_or("no Onbekend in line")?;
         assert_eq!(table.column_at(1, line, byte), 2);
+        Ok(())
     }
 
     #[test]
@@ -338,24 +344,29 @@ mod tests {
     fn reports_rows_that_do_not_fit_the_header() {
         let text = "a,b,c\n1,2,3\n1,2,3,4\n1,2\n\n";
         let (_, table) = highlight(text, b',');
-        let found: Vec<(&str, &str)> = table
+        let found: Vec<(Option<&str>, &str)> = table
             .problems
             .iter()
-            .map(|p| (&text[p.start..p.end], p.message.as_str()))
+            .map(|problem| {
+                (
+                    text.get(problem.start..problem.end),
+                    problem.message.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             found.len(),
             2,
             "{:?}",
-            found.iter().map(|f| f.1).collect::<Vec<_>>()
+            found.iter().map(|item| item.1).collect::<Vec<_>>()
         );
-        assert_eq!(found[0].0, "4");
-        assert_eq!(found[1].0, "1,2");
+        let marked: Vec<Option<&str>> = found.iter().map(|item| item.0).collect();
+        assert_eq!(marked, [Some("4"), Some("1,2")]);
     }
 
     #[test]
     fn reports_an_unclosed_quote() {
         let (_, table) = highlight("a,b\n1,\"open\n", b',');
-        assert!(table.problems.iter().any(|p| p.error));
+        assert!(table.problems.iter().any(|problem| problem.error));
     }
 }
