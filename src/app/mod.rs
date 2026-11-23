@@ -218,6 +218,12 @@ impl App {
                     review.pick(sources);
                 }
             }
+            Event::ReviewChoices(result) => {
+                if let Some(review) = &mut self.review {
+                    let outcome = review.choices(result);
+                    self.review_outcome(outcome);
+                }
+            }
             Event::ReviewLoaded(result) => {
                 if let Some(review) = &mut self.review {
                     review.loaded(result);

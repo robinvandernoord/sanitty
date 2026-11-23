@@ -10,12 +10,12 @@ sanitty is a non-modal IDE written in Rust that runs entirely in the terminal. J
 - Find and replace in the current file, or search across the project with Find in Files.
 - Language servers provide definition and implementation jumps, usages, rename, problems, quick documentation, formatting and completion. Completion applies auto-imports when the server supplies them.
 - Tree-sitter syntax highlighting (edits reparse only what changed, except in TypeScript), rainbow columns for CSV and TSV, and colour swatches next to colour values in style files.
-- A Review view (`Alt+9`) for your uncommitted changes or this branch against main: a side-by-side or inline diff, comments on lines and ranges, viewed marks, and the whole review copied to the clipboard as Markdown. Comments are kept between runs, outside the project.
+- A Review view (`Alt+9`) for your uncommitted changes, this branch against main, one or more commits, or an open GitHub pull request (through `gh`): a side-by-side or inline diff in syntax colours, comments on lines and ranges, viewed marks, and the whole review copied to the clipboard as Markdown. Comments are kept between runs, outside the project.
 - Check Keys records which shortcuts reach sanitty.
 
 ## Status
 
-sanitty is an early personal project. The editor and language-server milestones are complete, and the review view is in progress. The database view, multi-caret editing and a settings file are planned. See [PLAN.md](PLAN.md).
+sanitty is an early personal project. The editor, language-server and review milestones are complete. The database view, multi-caret editing and a settings file are planned. See [PLAN.md](PLAN.md).
 
 ## Build and run
 

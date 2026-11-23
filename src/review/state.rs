@@ -94,20 +94,25 @@ pub struct Saved {
     pub last_source: Option<Source>,
     pub working_tree: SourceState,
     pub branch: SourceState,
+    /// Reviews of commits and pull requests, by [`Source::key`].
+    #[serde(default)]
+    pub others: HashMap<String, SourceState>,
 }
 
 impl Saved {
-    pub fn source(&self, source: Source) -> &SourceState {
+    pub fn source(&self, source: &Source) -> Option<&SourceState> {
         match source {
-            Source::WorkingTree => &self.working_tree,
-            Source::Branch => &self.branch,
+            Source::WorkingTree => Some(&self.working_tree),
+            Source::Branch => Some(&self.branch),
+            other => self.others.get(&other.key()),
         }
     }
 
-    pub fn source_mut(&mut self, source: Source) -> &mut SourceState {
+    pub fn source_mut(&mut self, source: &Source) -> &mut SourceState {
         match source {
             Source::WorkingTree => &mut self.working_tree,
             Source::Branch => &mut self.branch,
+            other => self.others.entry(other.key()).or_default(),
         }
     }
 }

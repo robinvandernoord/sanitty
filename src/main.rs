@@ -83,6 +83,8 @@ pub enum Event {
     Launcher(u64, picker::Kind, Vec<picker::Item>),
     /// The sources the Review view can show, for its picker.
     ReviewSources(Vec<review::git::SourceInfo>),
+    /// Commits or pull requests for the Review view to pick from.
+    ReviewChoices(Result<review::git::Choices, String>),
     /// A diff for the Review view, or why it could not be loaded.
     ReviewLoaded(Result<review::git::Loaded, String>),
     Tick,

@@ -49,7 +49,7 @@ impl App {
         true
     }
 
-    fn review_outcome(&mut self, outcome: Outcome) {
+    pub(super) fn review_outcome(&mut self, outcome: Outcome) {
         let Some(review) = &self.review else { return };
         let root = review.root().to_path_buf();
         match outcome {
@@ -75,6 +75,16 @@ impl App {
                 let tx = self.tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let _ = tx.send(Event::ReviewLoaded(git::load(&root, source)));
+                });
+            }
+            Outcome::Fetch(entry) => {
+                let tx = self.tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let list = match entry {
+                        git::Entry::Prs => git::prs(&root),
+                        _ => git::commits(&root),
+                    };
+                    let _ = tx.send(Event::ReviewChoices(list));
                 });
             }
             Outcome::Sources => {

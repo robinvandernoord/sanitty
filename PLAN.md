@@ -89,14 +89,19 @@ here.
 
 - Opening: `Alt+9` shows the source picker the first time, then the last source; `s`
   picks another. The same key goes back to the code.
-- Sources, in order: working tree vs HEAD and this branch vs main first; a single commit
-  and a GitHub PR (via `gh`) later in the milestone.
+- Sources, from the picker: your changes (working tree vs HEAD), this branch vs main,
+  commits (a filterable list of the last 200; Space picks several, and the review then
+  covers everything from the oldest to the newest picked, saying so when that includes
+  commits you did not pick), and an open GitHub pull request (a filterable list through
+  `gh`; its commits are fetched for the syntax colours when they are not local yet).
+  Each commit range and PR keeps its own comments.
 - Layout: side-by-side, switching to inline when the terminal is narrow; `\` toggles.
 - Keys inside the view are plain letters (nothing is typed into a diff): Up/Down move,
   Tab switches between the file list and the diff, Shift+Up/Down select a range,
   `c` comments on the line or range, Enter on a comment edits it, `d` deletes it, `v`
   marks the file viewed, `]`/`[` go to the next/previous file, `y` copies the review,
-  `x` clears all comments (asks first). Enter on a diff line does nothing.
+  `x` discards the review (asks first): its comments and viewed marks go, and the
+  source picker opens; Alt+9 then asks again too. Enter on a diff line does nothing.
 - Comments on a line or range, typed as issue / suggestion / note / praise (Tab cycles
   the type in the comment box).
 - Export (`y`): the whole review as Markdown to the clipboard (OSC 52, works over SSH),
@@ -113,7 +118,7 @@ here.
   +       l.price ...
   ```
   ````
-- Comments and viewed marks are kept across restarts until the review is cleared. A
+- Comments and viewed marks are kept across restarts until the review is discarded. A
   comment stays on its line while that line's text is still in the diff.
 - State lives outside the project, in `~/.local/state/sanitty/`, one file per
   repository (both sources, and which one was used last), so nothing shows up in the
@@ -300,10 +305,9 @@ Config lives in `~/.config/sanitty/` (keymap, theme, settings) and per project i
    Known limit: Rust files of several MB with doc
    comments still take about 0.5 s per keystroke (karet rebuilds embedded layers on
    every edit).
-3. **Review** (started): the Review view with your changes and this branch vs main as
-   sources, split and inline diffs, line and range comments, viewed marks, Markdown
-   export, state kept between runs. Remaining: a single commit and a GitHub PR as
-   sources.
+3. **Review** (done): the Review view with four sources (your changes, this branch vs
+   main, commits, a GitHub PR), split and inline diffs in syntax colours, line and range
+   comments, viewed marks, Markdown export, state kept between runs.
 4. **Database**: compose discovery, schema tree, query editor, result grid, confirmed
    writes, `Alt+Enter` from `.sql` files.
 5. **Polish**: search in files, multi-caret, VS Code theme loading, settings file.

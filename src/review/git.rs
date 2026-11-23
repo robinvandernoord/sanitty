@@ -18,22 +18,90 @@ use super::colour::FileColours;
 /// Untracked files larger than this are listed without their content.
 const MAX_UNTRACKED_BYTES: u64 = 1024 * 1024;
 
+/// How many commits the commit list offers.
+const COMMITS: &str = "200";
+
+/// git's empty tree, the parent side of a repository's first commit.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 /// What a review compares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Source {
     /// Uncommitted changes (staged, unstaged and untracked) against HEAD.
     WorkingTree,
     /// This branch against the main branch, from where they split.
     Branch,
+    /// Commits from `oldest` to `newest` (full hashes), against the parent of
+    /// `oldest`. One commit when they are the same.
+    Commits { oldest: String, newest: String },
+    /// A GitHub pull request, through `gh`.
+    PullRequest { number: u64 },
+}
+
+impl Source {
+    /// The name a review of this source is kept under.
+    pub fn key(&self) -> String {
+        match self {
+            Self::WorkingTree => "working-tree".into(),
+            Self::Branch => "branch".into(),
+            Self::Commits { oldest, newest } => format!("commits:{oldest}..{newest}"),
+            Self::PullRequest { number } => format!("pr:{number}"),
+        }
+    }
+}
+
+/// What choosing a picker entry does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Entry {
+    /// Review this source.
+    Load(Source),
+    /// Pick commits from a list first.
+    Commits,
+    /// Pick a pull request from a list first.
+    Prs,
+}
+
+/// A commit in the commit list.
+#[derive(Clone, Debug)]
+pub struct Commit {
+    pub hash: String,
+    pub short: String,
+    /// "3 days ago".
+    pub when: String,
+    pub author: String,
+    pub subject: String,
+}
+
+/// An open pull request in the PR list.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+    #[serde(rename = "headRefName")]
+    pub branch: String,
+    pub author: Author,
+    #[serde(rename = "isDraft", default)]
+    pub draft: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Author {
+    pub login: String,
+}
+
+/// A list to pick from, as fetched.
+pub enum Choices {
+    Commits(Vec<Commit>),
+    Prs(Vec<PullRequest>),
 }
 
 /// A source as the picker shows it.
 #[derive(Clone, Debug)]
 pub struct SourceInfo {
-    pub source: Source,
+    pub entry: Entry,
     /// "Your changes" or "This branch".
     pub title: &'static str,
-    /// "working tree vs HEAD" or "feature/cart vs main".
+    /// "working tree vs HEAD", "feature/cart vs main", or what the list offers.
     pub detail: String,
     /// Changed files, when they could be counted.
     pub files: Option<usize>,
@@ -177,27 +245,157 @@ pub fn sources(root: &Path) -> Vec<SourceInfo> {
             None,
         ),
     };
+    let has_github = on_path("gh");
     vec![
         SourceInfo {
-            source: Source::WorkingTree,
+            entry: Entry::Load(Source::WorkingTree),
             title: "Your changes",
             detail: "working tree vs HEAD".to_string(),
             files: working,
             unavailable: None,
         },
         SourceInfo {
-            source: Source::Branch,
+            entry: Entry::Load(Source::Branch),
             title: "This branch",
             detail,
             files,
             unavailable,
         },
+        SourceInfo {
+            entry: Entry::Commits,
+            title: "Commits...",
+            detail: "pick one or more from the history".to_string(),
+            files: None,
+            unavailable: None,
+        },
+        SourceInfo {
+            entry: Entry::Prs,
+            title: "Pull request...",
+            detail: "pick an open one from GitHub".to_string(),
+            files: None,
+            unavailable: (!has_github).then(|| "needs the GitHub CLI, gh".to_string()),
+        },
     ]
+}
+
+fn on_path(cmd: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(cmd).is_file()))
+}
+
+/// Run the GitHub CLI in `root` and return what it printed.
+fn github(root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("gh")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .map_err(|err| format!("gh: {err}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "gh: {}",
+            message.lines().next().unwrap_or("failed")
+        ))
+    }
+}
+
+/// The recent commits of HEAD, newest first.
+pub fn commits(root: &Path) -> Result<Choices, String> {
+    let out = git(
+        root,
+        &[
+            "log",
+            "-n",
+            COMMITS,
+            "--format=%H%x1f%h%x1f%ar%x1f%an%x1f%s",
+        ],
+    )?;
+    let list = out
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            Some(Commit {
+                hash: parts.next()?.to_string(),
+                short: parts.next()?.to_string(),
+                when: parts.next()?.to_string(),
+                author: parts.next()?.to_string(),
+                subject: parts.next().unwrap_or("").to_string(),
+            })
+        })
+        .collect();
+    Ok(Choices::Commits(list))
+}
+
+/// The repository's open pull requests, the current branch's first.
+pub fn prs(root: &Path) -> Result<Choices, String> {
+    let out = github(
+        root,
+        &[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,title,headRefName,author,isDraft",
+        ],
+    )?;
+    let mut list: Vec<PullRequest> =
+        serde_json::from_str(&out).map_err(|err| format!("gh pr list: {err}"))?;
+    // The current branch's PR first; on the main branch itself there is none
+    // (a fork's PR from its own `main` is not ours).
+    let branch = current_branch(root);
+    if base_branch(root).as_deref() != Some(branch.as_str()) {
+        list.sort_by_key(|request| request.branch != branch);
+    }
+    Ok(Choices::Prs(list))
 }
 
 /// Load the diff for `source`.
 pub fn load(root: &Path, source: Source) -> Result<Loaded, String> {
     let diff_args = ["diff", "--no-color", "--no-ext-diff", "-M"];
+    match &source {
+        Source::Commits { oldest, newest } => {
+            // The first commit of a repository has no parent: compare with
+            // the empty tree.
+            let parent = git(
+                root,
+                &["rev-parse", "--verify", "--quiet", &format!("{oldest}^")],
+            )
+            .map_or_else(|_| EMPTY_TREE.to_string(), |rev| rev.trim().to_string());
+            let raw = git(
+                root,
+                &[&diff_args[..], &[parent.as_str(), newest.as_str()]].concat(),
+            )?;
+            let files = karet_diff::parse(&raw)
+                .map_err(|err| format!("cannot read the diff: {err}"))?
+                .files;
+            let colours = colours(root, &files, &parent, Some(newest));
+            let short = |hash: &str| hash.chars().take(7).collect::<String>();
+            let detail = if oldest == newest {
+                let subject = git(root, &["log", "-1", "--format=%s", newest]).unwrap_or_default();
+                format!("commit {} {}", short(newest), subject.trim())
+            } else {
+                let count = git(
+                    root,
+                    &["rev-list", "--count", &format!("{parent}..{newest}")],
+                )
+                .map_or_else(|_| "?".to_string(), |out| out.trim().to_string());
+                format!("{count} commits {}..{}", short(oldest), short(newest))
+            };
+            return Ok(Loaded {
+                source,
+                detail,
+                files,
+                colours,
+            });
+        }
+        Source::PullRequest { number } => return load_pr(root, source.clone(), *number),
+        Source::WorkingTree | Source::Branch => {}
+    }
     match source {
         Source::WorkingTree => {
             let raw = git(root, &[&diff_args[..], &["HEAD"]].concat())?;
@@ -217,6 +415,7 @@ pub fn load(root: &Path, source: Source) -> Result<Loaded, String> {
                 colours,
             })
         }
+        Source::Commits { .. } | Source::PullRequest { .. } => Err("not a local source".into()),
         Source::Branch => {
             let branch = current_branch(root);
             let base = base_branch(root).ok_or("No main or master branch to compare with")?;
@@ -240,6 +439,57 @@ pub fn load(root: &Path, source: Source) -> Result<Loaded, String> {
             })
         }
     }
+}
+
+/// A pull request's title and the commits at its two ends.
+#[derive(Deserialize)]
+struct Heads {
+    title: String,
+    #[serde(rename = "headRefOid")]
+    head: String,
+    #[serde(rename = "baseRefOid")]
+    base: String,
+}
+
+/// A pull request: its diff from GitHub, its two sides from git for the
+/// colours (its commit is fetched when it is not here yet).
+fn load_pr(root: &Path, source: Source, number: u64) -> Result<Loaded, String> {
+    let id = number.to_string();
+    let raw = github(root, &["pr", "diff", &id, "--color", "never"])?;
+    let files = karet_diff::parse(&raw)
+        .map_err(|err| format!("cannot read the diff: {err}"))?
+        .files;
+    let heads: Option<Heads> = github(
+        root,
+        &["pr", "view", &id, "--json", "title,headRefOid,baseRefOid"],
+    )
+    .ok()
+    .and_then(|out| serde_json::from_str(&out).ok());
+    let detail = heads.as_ref().map_or_else(
+        || format!("PR #{number}"),
+        |heads| format!("PR #{number} {}", heads.title),
+    );
+    // Colours need both sides here; without them the diff is still shown.
+    let colours = heads
+        .filter(|heads| have_commit(root, &heads.head) && have_commit(root, &heads.base))
+        .and_then(|heads| {
+            let fork = git(root, &["merge-base", &heads.base, &heads.head]).ok()?;
+            Some(colours(root, &files, fork.trim(), Some(&heads.head)))
+        })
+        .unwrap_or_default();
+    Ok(Loaded {
+        source,
+        detail,
+        files,
+        colours,
+    })
+}
+
+/// Whether `oid` is in the repository, fetching it from `origin` if not.
+fn have_commit(root: &Path, oid: &str) -> bool {
+    let present =
+        |root: &Path| git(root, &["cat-file", "-e", &format!("{oid}^{{commit}}")]).is_ok();
+    present(root) || (git(root, &["fetch", "--quiet", "origin", oid]).is_ok() && present(root))
 }
 
 /// A new, untracked file as an addition of all its lines.

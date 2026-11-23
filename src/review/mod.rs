@@ -7,6 +7,7 @@
 
 mod colour;
 pub mod git;
+mod pick;
 mod rows;
 pub mod state;
 
@@ -33,9 +34,13 @@ use ratatui::widgets::BorderType;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 
+use git::Choices;
+use git::Entry;
 use git::Loaded;
 use git::Source;
 use git::SourceInfo;
+use pick::Picked;
+use pick::Picker;
 use rows::Row;
 use state::Comment;
 use state::Kind;
@@ -57,7 +62,11 @@ pub enum Outcome {
     Load(Source),
     /// Find the sources (off the app loop) and hand them to [`Review::pick`].
     Sources,
-    /// Leave the view (the picker was closed before anything was loaded).
+    /// Fetch the commits or pull requests to pick from (off the app loop)
+    /// and hand them to [`Review::choices`].
+    Fetch(Entry),
+    /// Go back to the code (Ctrl+C, or the picker closed before anything
+    /// was loaded).
     Leave,
 }
 
@@ -95,8 +104,11 @@ pub struct Review {
     loading: bool,
     /// Why the last load failed.
     error: Option<String>,
-    /// The source list, while it is open.
-    picker: Option<(Vec<SourceInfo>, usize)>,
+    /// The source list (or commit or PR list), while it is open.
+    picker: Option<Picker>,
+    /// Something to know about a source (commits included that were not
+    /// picked), shown while that source is on screen.
+    notice: Option<(Source, String)>,
     file: usize,
     file_scroll: usize,
     focus: Focus,
@@ -126,6 +138,7 @@ impl Review {
             loading: false,
             error: None,
             picker: None,
+            notice: None,
             file: 0,
             file_scroll: 0,
             focus: Focus::Diff,
@@ -149,7 +162,7 @@ impl Review {
     /// have changed), or ask which one the first time.
     pub fn open(&mut self) -> Outcome {
         self.loading = true;
-        match self.saved.last_source {
+        match self.saved.last_source.clone() {
             Some(source) => Outcome::Load(source),
             None => Outcome::Sources,
         }
@@ -158,12 +171,43 @@ impl Review {
     /// The sources arrived: show the picker.
     pub fn pick(&mut self, sources: Vec<SourceInfo>) {
         self.loading = false;
-        let current = self.loaded.as_ref().map(|loaded| loaded.source);
+        let current = self.source();
         let selected = sources
             .iter()
-            .position(|info| Some(info.source) == current)
+            .position(|info| matches!(&info.entry, Entry::Load(source) if Some(source) == current.as_ref()))
             .unwrap_or(0);
-        self.picker = Some((sources, selected));
+        self.picker = Some(Picker::Sources {
+            list: sources,
+            selected,
+        });
+    }
+
+    /// Commits or pull requests to pick from arrived (or failed).
+    pub fn choices(&mut self, result: Result<Choices, String>) -> Outcome {
+        self.loading = false;
+        match result {
+            Ok(Choices::Commits(list)) => {
+                self.picker = Some(Picker::Commits {
+                    list,
+                    query: String::new(),
+                    selected: 0,
+                    marked: Vec::new(),
+                });
+                Outcome::Pending
+            }
+            Ok(Choices::Prs(list)) if list.is_empty() => {
+                Outcome::Status("No open pull requests".into())
+            }
+            Ok(Choices::Prs(list)) => {
+                self.picker = Some(Picker::Prs {
+                    list,
+                    query: String::new(),
+                    selected: 0,
+                });
+                Outcome::Pending
+            }
+            Err(err) => Outcome::Status(err),
+        }
     }
 
     /// A diff arrived (or failed).
@@ -177,7 +221,7 @@ impl Review {
                     .is_some_and(|old| old.source == loaded.source);
                 let path = self.current_file().map(|file| file.path.clone());
                 // Comments move with their lines.
-                let comments = &mut self.saved.source_mut(loaded.source).comments;
+                let comments = &mut self.saved.source_mut(&loaded.source).comments;
                 for comment in comments.iter_mut() {
                     if let Some(file) = loaded.files.iter().find(|file| file.path == comment.path)
                         && let Some(moved) = state::reanchor(comment, file)
@@ -188,7 +232,7 @@ impl Review {
                 loaded
                     .files
                     .sort_by(|left, right| left.path.cmp(&right.path));
-                self.saved.last_source = Some(loaded.source);
+                self.saved.last_source = Some(loaded.source.clone());
                 self.loaded = Some(loaded);
                 self.error = None;
                 self.file = path
@@ -213,12 +257,14 @@ impl Review {
     }
 
     fn source(&self) -> Option<Source> {
-        self.loaded.as_ref().map(|loaded| loaded.source)
+        self.loaded.as_ref().map(|loaded| loaded.source.clone())
     }
 
     fn comments(&self) -> &[Comment] {
-        self.source()
-            .map_or(&[], |source| self.saved.source(source).comments.as_slice())
+        self.loaded
+            .as_ref()
+            .and_then(|loaded| self.saved.source(&loaded.source))
+            .map_or(&[], |state| state.comments.as_slice())
     }
 
     fn persist(&mut self) -> Option<String> {
@@ -263,6 +309,14 @@ impl Review {
     // ------------------------------------------------------------------ keys
 
     pub fn handle_key(&mut self, key: &KeyEvent) -> Outcome {
+        // Ctrl+C backs out, as everywhere: out of the comment box or picker
+        // (like Esc), else out of the view.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.picker.is_none() && self.editing.is_none() {
+                return Outcome::Leave;
+            }
+            return self.handle_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
         if self.picker.is_some() {
             return self.picker_key(key);
         }
@@ -290,7 +344,7 @@ impl Review {
             }
             KeyCode::Char('v') => return self.toggle_viewed(),
             KeyCode::Char('y') => return self.copy(),
-            KeyCode::Char('x') => return self.clear(clear),
+            KeyCode::Char('x') => return self.discard(clear),
             KeyCode::Char('c') => return self.start_comment(),
             KeyCode::Char('d') => return self.delete_comment(),
             KeyCode::Enter if self.focus == Focus::Files => self.focus = Focus::Diff,
@@ -310,33 +364,30 @@ impl Review {
     }
 
     fn picker_key(&mut self, key: &KeyEvent) -> Outcome {
-        let Some((sources, selected)) = &mut self.picker else {
+        let Some(picker) = &mut self.picker else {
             return Outcome::Pending;
         };
-        match key.code {
-            KeyCode::Up => *selected = selected.saturating_sub(1),
-            KeyCode::Down => *selected = (*selected + 1).min(sources.len().saturating_sub(1)),
-            KeyCode::Esc => {
+        match picker.handle_key(key) {
+            Picked::Pending => Outcome::Pending,
+            Picked::Status(text) => Outcome::Status(text),
+            Picked::Close => {
                 self.picker = None;
                 if self.loaded.is_none() {
                     return Outcome::Leave;
                 }
+                Outcome::Pending
             }
-            KeyCode::Enter => {
-                let Some(info) = sources.get(*selected) else {
-                    return Outcome::Pending;
-                };
-                if let Some(why) = &info.unavailable {
-                    return Outcome::Status(format!("{}: {why}", info.title));
-                }
-                let source = info.source;
+            Picked::Fetch(entry) => {
+                self.loading = true;
+                Outcome::Fetch(entry)
+            }
+            Picked::Load(source, note) => {
                 self.picker = None;
                 self.loading = true;
-                return Outcome::Load(source);
+                self.notice = note.map(|note| (source.clone(), note));
+                Outcome::Load(source)
             }
-            _ => {}
         }
-        Outcome::Pending
     }
 
     fn editing_key(&mut self, key: &KeyEvent) -> Outcome {
@@ -405,7 +456,7 @@ impl Review {
             return Outcome::Pending;
         };
         let (path, print) = (file.path.clone(), state::fingerprint(file));
-        let viewed = &mut self.saved.source_mut(source).viewed;
+        let viewed = &mut self.saved.source_mut(&source).viewed;
         if viewed.get(&path) == Some(&print) {
             viewed.remove(&path);
         } else {
@@ -426,9 +477,10 @@ impl Review {
     }
 
     fn is_viewed(&self, file: &FileDiff) -> bool {
-        self.source().is_some_and(|source| {
-            self.saved.source(source).viewed.get(&file.path) == Some(&state::fingerprint(file))
-        })
+        self.loaded
+            .as_ref()
+            .and_then(|loaded| self.saved.source(&loaded.source))
+            .is_some_and(|state| state.viewed.get(&file.path) == Some(&state::fingerprint(file)))
     }
 
     fn copy(&self) -> Outcome {
@@ -448,34 +500,47 @@ impl Review {
         files.sort_unstable();
         files.dedup();
         let status = format!(
-            "Copied review: {} in {} (Markdown). x clears them.",
+            "Copied review: {} in {} (Markdown). x discards the review.",
             plural(comments.len(), "comment"),
             plural(files.len(), "file")
         );
         Outcome::Copy(text, status)
     }
 
-    fn clear(&mut self, confirmed: bool) -> Outcome {
+    /// `x` twice: throw this review away (its comments and viewed marks),
+    /// forget it as the last source, and ask what to review next.
+    fn discard(&mut self, confirmed: bool) -> Outcome {
         let Some(source) = self.source() else {
             return Outcome::Pending;
         };
-        let count = self.comments().len();
-        if count == 0 {
-            return Outcome::Status("No comments to clear".into());
-        }
         if !confirmed {
             self.confirm_clear = true;
-            return Outcome::Status(format!(
-                "x again deletes all {} of this review",
-                plural(count, "comment")
-            ));
+            let count = self.comments().len();
+            let what = if count == 0 {
+                String::new()
+            } else {
+                format!(" and its {}", plural(count, "comment"))
+            };
+            return Outcome::Status(format!("x again discards this review{what}"));
         }
-        let state = self.saved.source_mut(source);
-        state.comments.clear();
-        state.viewed.clear();
-        self.refresh();
-        self.persist()
-            .map_or_else(|| Outcome::Status("Review cleared".into()), Outcome::Status)
+        match source {
+            Source::WorkingTree | Source::Branch => {
+                *self.saved.source_mut(&source) = state::SourceState::default();
+            }
+            other => {
+                self.saved.others.remove(&other.key());
+            }
+        }
+        self.saved.last_source = None;
+        self.loaded = None;
+        self.notice = None;
+        self.rows.clear();
+        self.reset_rows();
+        if let Some(err) = self.persist() {
+            return Outcome::Status(err);
+        }
+        self.loading = true;
+        Outcome::Sources
     }
 
     fn comment_at(&self, row: usize) -> Option<usize> {
@@ -547,7 +612,7 @@ impl Review {
         let (Some(idx), Some(source)) = (self.comment_at(self.cursor), self.source()) else {
             return Outcome::Pending;
         };
-        let comments = &mut self.saved.source_mut(source).comments;
+        let comments = &mut self.saved.source_mut(&source).comments;
         if idx < comments.len() {
             comments.remove(idx);
         }
@@ -570,7 +635,7 @@ impl Review {
         if body.is_empty() {
             return Outcome::Status("Empty comment not saved".into());
         }
-        let comments = &mut self.saved.source_mut(source).comments;
+        let comments = &mut self.saved.source_mut(&source).comments;
         match editing.target {
             Target::Existing(idx) => {
                 if let Some(comment) = comments.get_mut(idx) {
@@ -599,8 +664,8 @@ impl Review {
 
     /// The keys to show in the hint bar.
     pub fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        if self.picker.is_some() {
-            return vec![("Enter", "Review"), ("Up/Down", "Select"), ("Esc", "Close")];
+        if let Some(picker) = &self.picker {
+            return picker.hints();
         }
         if self.editing.is_some() {
             return vec![("Enter", "Save"), ("Tab", "Type"), ("Esc", "Cancel")];
@@ -616,8 +681,9 @@ impl Review {
             ("] [", "File"),
             ("Tab", "Files/diff"),
             ("y", "Copy review"),
-            ("s", "Source"),
         ]);
+        hints.push(("x", "Discard review"));
+        hints.push(("s", "Source"));
         hints
     }
 
@@ -675,6 +741,11 @@ impl Review {
                 plural(loaded.files.len(), "file"),
                 plural(self.comments().len(), "comment")
             );
+            if let Some((source, note)) = &self.notice
+                && *source == loaded.source
+            {
+                let _ = write!(text, "   ({note})");
+            }
         }
         if self.loading {
             text.push_str("   (loading...)");
@@ -932,56 +1003,9 @@ impl Review {
     }
 
     fn render_picker(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let Some((sources, selected)) = &self.picker else {
-            return;
-        };
-        let base = crate::styles::surface(theme);
-        let muted = theme.style(ThemeRole::Muted);
-        let lines: Vec<Line> = sources
-            .iter()
-            .enumerate()
-            .map(|(idx, info)| {
-                let count = match (&info.unavailable, info.files) {
-                    (Some(why), _) => format!("({why})"),
-                    (None, Some(files)) => plural(files, "file"),
-                    (None, None) => String::new(),
-                };
-                let line = Line::from(vec![
-                    Span::raw(format!(" {:<14}", info.title)),
-                    Span::styled(format!("{:<30}", info.detail), muted),
-                    Span::raw(format!("{count} ")),
-                ]);
-                if idx == *selected {
-                    line.style(Style::default().add_modifier(Modifier::REVERSED))
-                } else {
-                    line
-                }
-            })
-            .collect();
-        let width = lines
-            .iter()
-            .map(Line::width)
-            .max()
-            .unwrap_or(40)
-            .saturating_add(2);
-        let width = to_u16(width).min(area.width);
-        let height = to_u16(lines.len().saturating_add(2)).min(area.height);
-        let rect = Rect {
-            x: area.x.saturating_add(area.width.saturating_sub(width) / 2),
-            y: area.y.saturating_add(area.height / 4),
-            width,
-            height,
-        };
-        frame.render_widget(Clear, rect);
-        frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .title(" Review what? ")
-                    .style(base),
-            ),
-            rect,
-        );
+        if let Some(picker) = &self.picker {
+            picker.render(frame, area, theme);
+        }
     }
 }
 
