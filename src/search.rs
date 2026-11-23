@@ -12,7 +12,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use karet_core::LineCol;
-use karet_lsp::LspClient;
 use karet_search::Matcher;
 use karet_search::SearchQuery;
 use tokio::sync::mpsc::UnboundedSender;
@@ -99,7 +98,7 @@ fn hit(root: &Path, path: &Path, text: &str, start: usize, line: u32, col: u32) 
 }
 
 pub fn symbols(
-    client: Arc<LspClient>,
+    client: crate::lsp::Server,
     root: PathBuf,
     query: String,
     generation: u64,

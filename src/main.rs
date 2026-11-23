@@ -48,21 +48,33 @@ pub enum Event {
     LspReady(&'static str, Arc<LspClient>),
     LspFailed(&'static str, String),
     /// Problems for a file from one server (its key), replacing that server's last report.
-    Diagnostics(&'static str, PathBuf, Vec<Diagnostic>),
+    /// The document version it describes, when known, so an older report
+    /// cannot replace a newer one.
+    /// `related` marks problems a server mentioned for another file in a
+    /// pull answer.
+    Diagnostics(&'static str, PathBuf, Option<i32>, bool, Vec<Diagnostic>),
     Locations(lsp::Nav, Vec<Location>),
-    Rename(lsp::Edit),
+    /// A rename's edits, tagged with the request's id.
+    Rename(u64, lsp::Edit),
     /// Formatting edits (UTF-16 columns) for a file, computed against the
     /// buffer version given.
-    Formatted(PathBuf, u64, Vec<karet_core::TextEdit>),
+    /// The document's open instance and buffer version come along, so a
+    /// reply cannot land on a closed and reopened copy.
+    Formatted(PathBuf, u64, u64, Vec<karet_core::TextEdit>),
     /// A hover answer: file, caret position (chars), text, and whether it was
     /// asked for as a popup (Alt+H) rather than for the status line.
     Hover(PathBuf, karet_core::LineCol, Option<String>, bool),
     /// Completion candidates for the request with this generation, or why
     /// there are none.
     Completions(u64, Result<karet_core::CompletionList, String>),
-    /// A completion item filled in (docs, imports): generation, its index in
-    /// the list, and the server's answer (`None` if it had nothing).
-    CompletionResolved(u64, usize, Option<Box<karet_core::CompletionItem>>),
+    /// A completion item filled in (docs, imports): the list it belongs to,
+    /// its index in that list, and the server's answer (`None` if it had
+    /// nothing), or why it failed.
+    CompletionResolved(
+        u64,
+        usize,
+        Result<Option<Box<karet_core::CompletionItem>>, String>,
+    ),
     /// Semantic tokens for a file at an LSP document version (UTF-16 columns).
     Semantic(PathBuf, i32, Vec<karet_core::SemanticToken>),
     /// Async launcher results: search generation, kind, items.

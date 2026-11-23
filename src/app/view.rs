@@ -115,7 +115,7 @@ impl App {
                     && let Some(caret) = self
                         .docs
                         .get(self.active)
-                        .filter(|_| !self.home)
+                        .filter(|doc| !self.home && doc.path == completion.path)
                         .and_then(|doc| doc.state.primary_caret_cell(body, &doc.buffer, &[]))
                 {
                     completion.render(frame, body, caret, theme);

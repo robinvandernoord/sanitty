@@ -132,11 +132,14 @@ impl App {
     }
 
     pub(super) fn on_lsp_ready(&mut self, key: &'static str, client: Arc<LspClient>) {
+        // Servers already running get the edits they have not seen yet
+        // first; the new server then opens every document as it is now.
+        self.sync_lsp();
+        let server = self.lsp.ready(key, client);
         for doc in &mut self.docs {
             if let Some(lang) = doc.lsp_lang.filter(|lang| lsp::Hub::is_key(lang, key)) {
-                doc.lsp_synced = doc.buffer.version();
                 lsp::did_open(
-                    (key, client.clone()),
+                    (key, server.clone()),
                     doc.path.clone(),
                     lang,
                     doc.lsp_version,
@@ -145,7 +148,6 @@ impl App {
                 );
             }
         }
-        self.lsp.ready(key, client);
     }
 
     /// Send full text for every document edited since the last sync.
@@ -298,7 +300,16 @@ impl App {
             return;
         };
         self.sync_lsp();
-        lsp::rename(client, path, pos, name, self.tx.clone());
+        // What every open file looked like when the rename was asked for:
+        // the answer's ranges are only valid for that text.
+        self.rename_id = self.rename_id.wrapping_add(1);
+        let snapshot = self
+            .docs
+            .iter()
+            .map(|doc| (doc.path.clone(), (doc.instance, doc.buffer.version())))
+            .collect();
+        self.rename_snapshot = Some((self.rename_id, snapshot));
+        lsp::rename(client, self.rename_id, path, pos, name, self.tx.clone());
     }
 
     /// Reformat the current file through its language servers.
@@ -322,6 +333,7 @@ impl App {
         lsp::format(
             servers,
             doc.path.clone(),
+            doc.instance,
             doc.buffer.version(),
             indentation,
             self.tx.clone(),
@@ -332,10 +344,14 @@ impl App {
     pub(super) fn on_formatted(
         &mut self,
         path: &Path,
-        version: u64,
+        (instance, version): (u64, u64),
         edits: Vec<karet_core::TextEdit>,
     ) {
-        let Some(doc) = self.docs.iter_mut().find(|doc| doc.path == path) else {
+        let Some(doc) = self
+            .docs
+            .iter_mut()
+            .find(|doc| doc.path == path && doc.instance == instance)
+        else {
             return;
         };
         if doc.buffer.version() != version {
@@ -360,22 +376,76 @@ impl App {
         };
     }
 
-    pub(super) fn on_rename(&mut self, edit: lsp::Edit) {
+    pub(super) fn on_rename(&mut self, id: u64, edit: lsp::Edit) {
+        // Only the answer to the latest rename counts; its snapshot is the one
+        // stored.
+        let Some(snapshot) = self
+            .rename_snapshot
+            .take_if(|(stored, _)| *stored == id)
+            .map(|(_, snapshot)| snapshot)
+        else {
+            return;
+        };
         let here = self.here();
         let mut batches = edit.changes;
         let mut skipped = 0;
+        let mut versions = Vec::new();
         for change in edit.document_changes {
             match change {
                 karet_core::DocumentChange::Edit(doc_edit) => {
+                    versions.push((doc_edit.path.clone(), doc_edit.version));
                     batches.push((doc_edit.path, doc_edit.edits));
                 }
                 _ => skipped += 1,
             }
         }
+        // One spelling per file (a server may name it through a symlink), so
+        // the checks below and the edits use the file actually open.
+        for (path, _) in &mut batches {
+            if let Some(open) = self.docs.iter().find(|doc| same_file(&doc.path, path)) {
+                path.clone_from(&open.path);
+            }
+        }
+        for (path, _) in &mut versions {
+            if let Some(open) = self.docs.iter().find(|doc| same_file(&doc.path, path)) {
+                path.clone_from(&open.path);
+            }
+        }
+        // Any file open now that changed since the request (or opened and
+        // edited since) would get edits meant for other text: refuse all of
+        // it rather than rename half.
+        let changed = batches.iter().any(|(path, _)| {
+            self.docs.iter().any(|doc| {
+                &doc.path == path
+                    && snapshot
+                        .get(path)
+                        .map_or(doc.buffer.version() != doc.loaded_version, |seen| {
+                            *seen != (doc.instance, doc.buffer.version())
+                        })
+            })
+        }) || versions.iter().any(|(path, version)| {
+            version.is_some_and(|version| {
+                self.docs
+                    .iter()
+                    .any(|doc| &doc.path == path && doc.lsp_version != version)
+            })
+        });
+        if changed {
+            self.status =
+                "Not renamed: a file changed while the language server worked; try again".into();
+            return;
+        }
         let mut files = 0;
+        let mut failed = 0;
         for (path, edits) in batches {
             self.open(&path, None);
-            if let Some(doc) = self.doc() {
+            // A file that did not open leaves another one on screen, which
+            // must not get its edits.
+            let Some(doc) = self.doc().filter(|doc| same_file(&doc.path, &path)) else {
+                failed += 1;
+                continue;
+            };
+            {
                 let edits: Vec<TextEdit> = edits
                     .into_iter()
                     .map(|edit| TextEdit {
@@ -393,13 +463,30 @@ impl App {
         {
             self.active = idx;
         }
-        let note = if skipped > 0 {
-            format!(" ({skipped} file create/rename/delete ops skipped)")
-        } else {
-            String::new()
-        };
+        let mut notes = Vec::new();
+        if failed > 0 {
+            notes.push(format!(
+                " ({failed} file(s) could not be opened, not renamed there)"
+            ));
+        }
+        if skipped > 0 {
+            notes.push(format!(
+                " ({skipped} file create/rename/delete ops skipped)"
+            ));
+        }
+        let note = notes.concat();
         self.status = format!("Renamed in {files} file(s); save with Ctrl+S{note}");
     }
+}
+
+/// Whether two paths name the same file, also when one is written differently
+/// (a symlink, `..`) from the other.
+fn same_file(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (left.canonicalize(), right.canonicalize()),
+            (Ok(left), Ok(right)) if left == right
+        )
 }
 
 /// Problem messages at the end of their line: errors everywhere, and whatever

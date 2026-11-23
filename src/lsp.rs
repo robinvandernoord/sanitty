@@ -6,9 +6,11 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use karet_core::LineCol;
 use karet_core::Location;
@@ -16,7 +18,9 @@ use karet_core::WorkspaceEdit;
 use karet_lsp::LspClient;
 use karet_lsp::LspError;
 use karet_lsp::LspSpec;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 
 use crate::Event;
 
@@ -28,9 +32,137 @@ pub enum Nav {
     Usages,
 }
 
+/// Shown when a request is not sent because its server lost an edit.
+const STUCK: &str = "The language server stopped taking edits; restart sanitty to resync it";
+
+/// A document notification, sent to a server in the order it was queued.
+enum Note {
+    Open {
+        path: PathBuf,
+        lang: &'static str,
+        version: i32,
+        text: String,
+    },
+    Change {
+        path: PathBuf,
+        version: i32,
+        text: String,
+    },
+    Save(PathBuf),
+    Close(PathBuf),
+    /// Answered once every note queued before it has been sent.
+    Flushed(oneshot::Sender<()>),
+}
+
+/// A running language server. Document notifications go through one queue,
+/// so the server sees them in order, and a request first waits for the notes
+/// queued before it: a request never overtakes the edit it is about.
+#[derive(Clone)]
+pub struct Server {
+    client: Arc<LspClient>,
+    notes: UnboundedSender<Note>,
+    /// Set when a notification could not be sent even after retrying: the
+    /// server no longer has the editor's text, so no request is sent to it.
+    stuck: Arc<AtomicBool>,
+}
+
+impl Deref for Server {
+    type Target = LspClient;
+
+    fn deref(&self) -> &LspClient {
+        &self.client
+    }
+}
+
+impl Server {
+    fn new(client: Arc<LspClient>) -> Self {
+        let (notes, mut queue) = mpsc::unbounded_channel();
+        let worker = Arc::clone(&client);
+        let stuck = Arc::new(AtomicBool::new(false));
+        let mark_stuck = Arc::clone(&stuck);
+        tokio::spawn(async move {
+            while let Some(note) = queue.recv().await {
+                if let Note::Flushed(done) = note {
+                    let _ = done.send(());
+                    continue;
+                }
+                // A full outbound queue (a server that stopped reading) fails
+                // a notification at once; it is retried rather than lost, so
+                // the server never misses an edit. Everything queued after it
+                // waits, requests included.
+                let mut sent_ok = false;
+                for attempt in 0..100 {
+                    let sent = match &note {
+                        Note::Open {
+                            path,
+                            lang,
+                            version,
+                            text,
+                        } => worker.did_open(path, lang, *version, text).await,
+                        Note::Change {
+                            path,
+                            version,
+                            text,
+                        } => worker.did_change(path, *version, text).await,
+                        Note::Save(path) => worker.did_save(path, None).await,
+                        Note::Close(path) => worker.did_close(path).await,
+                        Note::Flushed(_) => Ok(()),
+                    };
+                    match sent {
+                        Ok(()) => {
+                            sent_ok = true;
+                            break;
+                        }
+                        Err(LspError::Protocol(msg)) if msg.contains("queue is full") => {
+                            crate::debug_log(&format!("notification (try {attempt}): {msg}"));
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        // Anything else (an exited server, a path it cannot
+                        // take) will not go better on a retry; it concerns
+                        // that one document, not the order of the rest.
+                        Err(err) => {
+                            crate::debug_log(&format!("notification: {err}"));
+                            sent_ok = true;
+                            break;
+                        }
+                    }
+                }
+                if !sent_ok {
+                    mark_stuck.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        Self {
+            client,
+            notes,
+            stuck,
+        }
+    }
+
+    fn note(&self, note: Note) {
+        let _ = self.notes.send(note);
+    }
+
+    /// Resolves once every notification queued so far has been sent. Taken
+    /// when the request is made (on the app loop), awaited in its task.
+    /// `false` when the server lost an edit (see `stuck`) or is gone: the
+    /// request is then not sent.
+    fn flushed(&self) -> impl Future<Output = bool> + Send + 'static {
+        let (done, wait) = oneshot::channel();
+        self.note(Note::Flushed(done));
+        let stuck = Arc::clone(&self.stuck);
+        async move { wait.await.is_ok() && !stuck.load(std::sync::atomic::Ordering::Relaxed) }
+    }
+
+    /// Tell the server a document is closed.
+    pub fn did_close(&self, path: PathBuf) {
+        self.note(Note::Close(path));
+    }
+}
+
 #[derive(Default)]
 pub struct Hub {
-    clients: HashMap<&'static str, Arc<LspClient>>,
+    clients: HashMap<&'static str, Server>,
     starting: HashSet<&'static str>,
     failed: HashMap<&'static str, String>,
 }
@@ -133,11 +265,7 @@ fn native_tsc(root: &Path) -> Option<PathBuf> {
         on_path("tsc").then(|| PathBuf::from("tsc")),
     ];
     candidates.into_iter().flatten().find(|tsc| {
-        std::process::Command::new(tsc)
-            .arg("--version")
-            .output()
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok())
+        version_output(tsc)
             .and_then(|version| {
                 version
                     .trim()
@@ -149,6 +277,34 @@ fn native_tsc(root: &Path) -> Option<PathBuf> {
             })
             .is_some_and(|major| major >= 7)
     })
+}
+
+/// What `<program> --version` prints, or `None` if it fails or takes longer
+/// than a few seconds (it is then killed).
+fn version_output(program: &Path) -> Option<String> {
+    use std::io::Read;
+    use std::process::Command;
+    use std::process::Stdio;
+    let mut child = Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Read on a thread of its own: a wrapper script can leave a child holding
+    // the pipe open after it exits, and the deadline must still hold.
+    let mut stdout = child.stdout.take()?;
+    let (done, output) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        let read = stdout.read_to_string(&mut out).map(|_| out);
+        let _ = done.send(read);
+    });
+    let read = output.recv_timeout(std::time::Duration::from_secs(5));
+    let _ = child.kill();
+    let _ = child.wait();
+    read.ok()?.ok()
 }
 
 /// `typescript/lib/tsserver.js`: the project's own, else a global install
@@ -171,12 +327,12 @@ fn find_tsserver(root: &Path) -> Option<PathBuf> {
 
 impl Hub {
     /// The main server for `lang`.
-    pub fn client(&self, lang: &str) -> Option<Arc<LspClient>> {
+    pub fn client(&self, lang: &str) -> Option<Server> {
         self.clients.get(server_key(lang)).cloned()
     }
 
     /// Every running server for `lang` (main and linters), with its key.
-    pub fn running(&self, lang: &str) -> Vec<(&'static str, Arc<LspClient>)> {
+    pub fn running(&self, lang: &str) -> Vec<(&'static str, Server)> {
         server_keys(lang)
             .iter()
             .filter_map(|key| Some((*key, self.clients.get(key)?.clone())))
@@ -184,7 +340,7 @@ impl Hub {
     }
 
     /// Any running main server, for workspace-wide queries with no file open.
-    pub fn any_client(&self) -> Option<Arc<LspClient>> {
+    pub fn any_client(&self) -> Option<Server> {
         self.clients
             .iter()
             .find(|(key, _)| !is_linter(key))
@@ -224,23 +380,28 @@ impl Hub {
         {
             return;
         }
-        let Some(spec) = spec_for(key, root) else {
-            if is_linter(key) {
-                // Not installed: remember quietly, so it is not looked up again.
-                self.failed.insert(key, String::new());
-                return;
-            }
-            self.failed
-                .insert(key, format!("no language server installed for {lang}"));
-            let _ = tx.send(Event::Status(format!(
-                "No language server found for {lang}"
-            )));
-            return;
-        };
         self.starting.insert(key);
         let root = root.to_path_buf();
         let tx = tx.clone();
+        let lang = lang.to_string();
         tokio::spawn(async move {
+            // Finding the server runs programs (`tsc --version`), so it stays
+            // off the app loop.
+            let found = {
+                let root = root.clone();
+                tokio::task::spawn_blocking(move || spec_for(key, &root)).await
+            };
+            let Ok(Some(spec)) = found else {
+                // A missing linter is not worth a message (an empty one is
+                // not shown); it is remembered, so it is not looked up again.
+                let msg = if is_linter(key) {
+                    String::new()
+                } else {
+                    format!("No language server found for {lang}")
+                };
+                let _ = tx.send(Event::LspFailed(key, msg));
+                return;
+            };
             let name = spec.command.clone();
             match LspClient::spawn(spec, &root).await {
                 Ok(client) => {
@@ -248,11 +409,24 @@ impl Hub {
                     let mut diags = client.diagnostics();
                     let diag_tx = tx.clone();
                     tokio::spawn(async move {
-                        while let Ok(report) = diags.recv().await {
-                            if diag_tx
-                                .send(Event::Diagnostics(key, report.path, report.diagnostics))
-                                .is_err()
-                            {
+                        loop {
+                            let report = match diags.recv().await {
+                                Ok(report) => report,
+                                // Fell behind a burst: some reports were
+                                // skipped, later ones still come.
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    continue;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            };
+                            let event = Event::Diagnostics(
+                                key,
+                                report.path,
+                                report.version,
+                                false,
+                                report.diagnostics,
+                            );
+                            if diag_tx.send(event).is_err() {
                                 break;
                             }
                         }
@@ -266,9 +440,12 @@ impl Hub {
         });
     }
 
-    pub fn ready(&mut self, key: &'static str, client: Arc<LspClient>) {
+    /// Take a server that finished starting; returns it, ready for use.
+    pub fn ready(&mut self, key: &'static str, client: Arc<LspClient>) -> Server {
         self.starting.remove(key);
-        self.clients.insert(key, client);
+        let server = Server::new(client);
+        self.clients.insert(key, server.clone());
+        server
     }
 
     pub fn failed(&mut self, key: &'static str, msg: String) {
@@ -282,15 +459,25 @@ impl Hub {
 }
 
 pub fn did_open(
-    (key, client): (&'static str, Arc<LspClient>),
+    (key, server): (&'static str, Server),
     path: PathBuf,
     lang: &'static str,
     version: i32,
     text: String,
     tx: UnboundedSender<Event>,
 ) {
+    server.note(Note::Open {
+        path: path.clone(),
+        lang,
+        version,
+        text,
+    });
+    let flushed = server.flushed();
     tokio::spawn(async move {
-        let _ = client.did_open(&path, lang, version, &text).await;
+        if !flushed.await {
+            let _ = tx.send(Event::Status(STUCK.into()));
+            return;
+        }
         // Right after start-up a server may not answer yet (or not have
         // registered its features); retry for a few seconds.
         // A server can register features after it starts (ty does), so
@@ -302,8 +489,8 @@ pub fn did_open(
                 Answer::Unsupported => attempt >= 4,
                 Answer::Failed => false,
             };
-            problems = problems || settled(pull(key, &client, &path, &tx).await);
-            colours = colours || settled(semantic(&client, &path, version, &tx).await);
+            problems = problems || settled(pull(key, &server, &path, version, &tx).await);
+            colours = colours || settled(semantic(&server, &path, version, &tx).await);
             if problems && colours {
                 break;
             }
@@ -313,29 +500,45 @@ pub fn did_open(
 }
 
 pub fn did_change(
-    (key, client): (&'static str, Arc<LspClient>),
+    (key, server): (&'static str, Server),
     path: PathBuf,
     version: i32,
     text: String,
     tx: UnboundedSender<Event>,
 ) {
+    server.note(Note::Change {
+        path: path.clone(),
+        version,
+        text,
+    });
+    let flushed = server.flushed();
     tokio::spawn(async move {
-        let _ = client.did_change(&path, version, &text).await;
-        pull(key, &client, &path, &tx).await;
+        if !flushed.await {
+            let _ = tx.send(Event::Status(STUCK.into()));
+            return;
+        }
+        pull(key, &server, &path, version, &tx).await;
         if !is_linter(key) {
-            semantic(&client, &path, version, &tx).await;
+            semantic(&server, &path, version, &tx).await;
         }
     });
 }
 
+/// `version` is the document version the server has, for tagging problems.
 pub fn did_save(
-    (key, client): (&'static str, Arc<LspClient>),
+    (key, server): (&'static str, Server),
     path: PathBuf,
+    version: i32,
     tx: UnboundedSender<Event>,
 ) {
+    server.note(Note::Save(path.clone()));
+    let flushed = server.flushed();
     tokio::spawn(async move {
-        let _ = client.did_save(&path, None).await;
-        pull(key, &client, &path, &tx).await;
+        if !flushed.await {
+            let _ = tx.send(Event::Status(STUCK.into()));
+            return;
+        }
+        pull(key, &server, &path, version, &tx).await;
     });
 }
 
@@ -358,10 +561,12 @@ impl Answer {
 
 /// Ask for a document's problems, for servers (ty) that only report when
 /// asked. Servers that push them instead answer `Unsupported`, which is fine.
+/// Problems are tagged with the document `version` they describe.
 async fn pull(
     key: &'static str,
     client: &LspClient,
     path: &Path,
+    version: i32,
     tx: &UnboundedSender<Event>,
 ) -> Answer {
     let report = match client.pull_diagnostics(path, None).await {
@@ -377,10 +582,22 @@ async fn pull(
         report.diagnostics.as_ref().map(Vec::len)
     ));
     if let Some(diags) = report.diagnostics {
-        let _ = tx.send(Event::Diagnostics(key, path.to_path_buf(), diags));
+        let _ = tx.send(Event::Diagnostics(
+            key,
+            path.to_path_buf(),
+            Some(version),
+            false,
+            diags,
+        ));
     }
     for other in report.related {
-        let _ = tx.send(Event::Diagnostics(key, other.path, other.diagnostics));
+        let _ = tx.send(Event::Diagnostics(
+            key,
+            other.path,
+            None,
+            true,
+            other.diagnostics,
+        ));
     }
     Answer::Done
 }
@@ -388,14 +605,19 @@ async fn pull(
 /// Ask for hover text at `pos16` (UTF-16); the answer is tagged with the
 /// caret position `pos` (chars) it belongs to.
 pub fn hover(
-    client: Arc<LspClient>,
+    client: Server,
     path: PathBuf,
     pos: LineCol,
     pos16: LineCol,
     popup: bool,
     tx: UnboundedSender<Event>,
 ) {
+    let flushed = client.flushed();
     tokio::spawn(async move {
+        if !flushed.await {
+            let _ = tx.send(Event::Status(STUCK.into()));
+            return;
+        }
         let text = client
             .hover(&path, pos16)
             .await
@@ -441,14 +663,13 @@ async fn semantic(
     }
 }
 
-pub fn navigate(
-    client: Arc<LspClient>,
-    nav: Nav,
-    path: PathBuf,
-    pos: LineCol,
-    tx: UnboundedSender<Event>,
-) {
+pub fn navigate(client: Server, nav: Nav, path: PathBuf, pos: LineCol, tx: UnboundedSender<Event>) {
+    let flushed = client.flushed();
     tokio::spawn(async move {
+        if !flushed.await {
+            let _ = tx.send(Event::Status(STUCK.into()));
+            return;
+        }
         let result = match nav {
             Nav::Definition => client.definition(&path, pos).await,
             Nav::Implementation => client.implementations(&path, pos).await,
@@ -464,8 +685,9 @@ pub fn navigate(
 /// Ask the first of `servers` that can format `path` (ruff before ty, which
 /// cannot) for the edits that reformat it as it is at `version`.
 pub fn format(
-    servers: Vec<(&'static str, Arc<LspClient>)>,
+    servers: Vec<(&'static str, Server)>,
     path: PathBuf,
+    instance: u64,
     version: u64,
     indentation: karet_lsp::Indentation,
     tx: UnboundedSender<Event>,
@@ -481,9 +703,14 @@ pub fn format(
         ));
         return;
     };
+    let flushed = client.flushed();
     tokio::spawn(async move {
+        if !flushed.await {
+            let _ = tx.send(Event::Status(STUCK.into()));
+            return;
+        }
         let _ = tx.send(match client.formatting(&path, indentation).await {
-            Ok(edits) => Event::Formatted(path, version, edits),
+            Ok(edits) => Event::Formatted(path, instance, version, edits),
             Err(err) => Event::Status(format!("Reformat: {err}")),
         });
     });
@@ -491,14 +718,19 @@ pub fn format(
 
 /// Ask `client` for completions at `pos16` (UTF-16), tagged with `generation`.
 pub fn complete(
-    client: Arc<LspClient>,
+    client: Server,
     path: PathBuf,
     pos16: LineCol,
     trigger: karet_core::CompletionTrigger,
     generation: u64,
     tx: UnboundedSender<Event>,
 ) {
+    let flushed = client.flushed();
     tokio::spawn(async move {
+        if !flushed.await {
+            let _ = tx.send(Event::Status(STUCK.into()));
+            return;
+        }
         let answer = client
             .completion(&path, pos16, trigger)
             .await
@@ -516,35 +748,46 @@ pub fn complete(
 }
 
 /// Ask `client` to fill in what it left out of a completion item (its docs,
-/// an import it needs).
+/// an import it needs). `list` and `index` say which row it is.
 pub fn resolve_completion(
-    client: Arc<LspClient>,
+    client: Server,
     item: karet_core::CompletionItem,
-    generation: u64,
+    list: u64,
     index: usize,
     tx: UnboundedSender<Event>,
 ) {
+    let flushed = client.flushed();
     tokio::spawn(async move {
+        if !flushed.await {
+            let _ = tx.send(Event::Status(STUCK.into()));
+            return;
+        }
         let resolved = client
             .resolve_completion(&item)
             .await
-            .ok()
-            .flatten()
-            .map(Box::new);
-        let _ = tx.send(Event::CompletionResolved(generation, index, resolved));
+            .map(|found| found.map(Box::new))
+            .map_err(|err| err.to_string());
+        let _ = tx.send(Event::CompletionResolved(list, index, resolved));
     });
 }
 
+/// `id` tags the answer, so only the latest rename's answer is applied.
 pub fn rename(
-    client: Arc<LspClient>,
+    client: Server,
+    id: u64,
     path: PathBuf,
     pos: LineCol,
     new_name: String,
     tx: UnboundedSender<Event>,
 ) {
+    let flushed = client.flushed();
     tokio::spawn(async move {
+        if !flushed.await {
+            let _ = tx.send(Event::Status(STUCK.into()));
+            return;
+        }
         let _ = tx.send(match client.rename(&path, pos, &new_name).await {
-            Ok(edit) => Event::Rename(edit),
+            Ok(edit) => Event::Rename(id, edit),
             Err(err) => Event::Status(format!("Rename: {err}")),
         });
     });

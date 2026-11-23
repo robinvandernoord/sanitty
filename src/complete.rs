@@ -7,13 +7,11 @@
 //! that moves the caret out of the word closes it too.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use karet_core::CompletionItem;
 use karet_core::CompletionKind;
 use karet_core::LineCol;
 use karet_core::TextEdit;
-use karet_lsp::LspClient;
 use nucleo_matcher::Config;
 use nucleo_matcher::Matcher;
 use nucleo_matcher::Utf32Str;
@@ -33,6 +31,9 @@ use ratatui::widgets::Paragraph;
 
 use crate::picker::keep_start;
 
+/// Numbers every completion list, for [`Completion::list`].
+static LISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Rows the list shows at most.
 const ROWS: usize = 10;
 
@@ -49,9 +50,12 @@ struct Columns {
 pub struct Completion {
     /// Tags requests and answers; an answer for an older request is dropped.
     pub generation: u64,
+    /// Which list the rows came from: bumped by every answer, so details
+    /// asked for a row of an older list never land on the new one.
+    pub list: u64,
     pub path: PathBuf,
     /// The server that answered, asked again to fill in the selected item.
-    pub client: Arc<LspClient>,
+    pub client: crate::lsp::Server,
     /// Where the word being completed starts (chars). Typing narrows the list
     /// by the text from here to the caret.
     pub anchor: LineCol,
@@ -70,15 +74,23 @@ pub struct Completion {
     pub prefix: String,
     /// Items whose details were asked for already.
     pub resolving: Vec<usize>,
-    /// Enter was pressed on an item still being filled in: accept it on arrival.
-    pub accepting: Option<usize>,
+    /// Enter was pressed on an item still being filled in: accept it on
+    /// arrival, if the text and caret are still as they were then.
+    /// (item index, buffer version, caret)
+    pub accepting: Option<(usize, u64, LineCol)>,
     matcher: Matcher,
 }
 
 impl Completion {
-    pub fn new(generation: u64, path: PathBuf, client: Arc<LspClient>, anchor: LineCol) -> Self {
+    pub fn new(
+        generation: u64,
+        path: PathBuf,
+        client: crate::lsp::Server,
+        anchor: LineCol,
+    ) -> Self {
         Self {
             generation,
+            list: 0,
             path,
             client,
             anchor,
@@ -104,6 +116,9 @@ impl Completion {
             left_key.cmp(right_key)
         });
         self.items = items;
+        // Unique across popups too: a reply for an earlier popup's row must
+        // not land on this one.
+        self.list = LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.loaded = true;
         self.incomplete = incomplete;
         self.resolving.clear();
@@ -122,6 +137,13 @@ impl Completion {
         self.selected = 0;
         self.scroll = 0;
         self.filtered = filter(&self.items, prefix, &mut self.matcher);
+    }
+
+    /// Select the row showing item `index`, if it is still listed.
+    pub fn select_item(&mut self, index: usize) {
+        if let Some(row) = self.filtered.iter().position(|&item| item == index) {
+            self.selected = row;
+        }
     }
 
     pub fn current(&self) -> Option<usize> {

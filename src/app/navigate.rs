@@ -151,6 +151,11 @@ impl App {
             match Doc::open(&path) {
                 Ok(doc) => {
                     let mut doc = doc;
+                    // Versions keep counting up across a close and reopen, so
+                    // a late answer about the earlier copy is recognised as old.
+                    if let Some(last) = self.closed_versions.get(&path) {
+                        doc.lsp_version = last.saturating_add(1);
+                    }
                     if let Some(diags) = self.problems.get(&path) {
                         doc.set_diagnostics(diags);
                     }

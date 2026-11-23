@@ -502,7 +502,16 @@ impl App {
             self.confirm = Some(Action::CloseFile);
             return;
         }
-        let closed = self.docs.remove(self.active).path;
+        let closed = self.docs.remove(self.active);
+        // The servers forget it too.
+        if let Some(lang) = closed.lsp_lang {
+            for (_, server) in self.lsp.running(lang) {
+                server.did_close(closed.path.clone());
+            }
+        }
+        self.closed_versions
+            .insert(closed.path.clone(), closed.lsp_version);
+        let closed = closed.path;
         self.status.clear();
         // Fall back to the most recently used file that is still open.
         self.active = self

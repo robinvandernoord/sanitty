@@ -104,32 +104,60 @@ impl App {
 
     pub(super) fn on_completion_resolved(
         &mut self,
-        generation: u64,
+        list: u64,
         index: usize,
-        resolved: Option<Box<CompletionItem>>,
+        resolved: Result<Option<Box<CompletionItem>>, String>,
     ) {
         let Some(popup) = &mut self.completion else {
             return;
         };
-        if popup.generation != generation {
+        if popup.list != list {
             return;
         }
         let Some(item) = popup.items.get_mut(index) else {
             return;
         };
         match resolved {
-            Some(full) => item.adopt_resolved(*full),
+            Ok(Some(full)) => item.adopt_resolved(*full),
             // Nothing more to get; stop waiting for it.
-            None => item.payload = None,
+            Ok(None) => item.payload = None,
+            // The import it may need is unknown: do not insert it without.
+            // Asking again (Enter) retries.
+            Err(err) => {
+                popup.resolving.retain(|&asked| asked != index);
+                if popup.accepting.take().is_some() {
+                    self.status = format!("Code completion: {err}; press Enter to try again");
+                }
+                return;
+            }
         }
-        if popup.accepting == Some(index) {
-            self.accept_completion();
+        if let Some((waiting, version, caret)) = popup.accepting
+            && waiting == index
+        {
+            popup.accepting = None;
+            // Accept only the row Enter was pressed on, and only if nothing
+            // changed since: no typing, no caret move, same file.
+            let path = popup.path.clone();
+            let unchanged = self.cur().is_some_and(|doc| {
+                doc.path == path && doc.buffer.version() == version && doc.caret() == caret
+            });
+            if let Some(popup) = &mut self.completion
+                && unchanged
+            {
+                popup.select_item(index);
+                if popup.current() == Some(index) {
+                    self.accept_completion();
+                }
+            }
         }
     }
 
     /// A key while the popup is open. Returns whether the popup used it; the
     /// rest (typing, Tab) goes on to the editor as usual.
     pub(super) fn completion_key(&mut self, key: &KeyEvent, action: Option<Action>) -> bool {
+        // Something else (a jump to another file, say) may have moved the
+        // caret out of the word since the last key.
+        self.refresh_completion();
         if self.completion.is_none() || !matches!(self.overlay, Overlay::None) {
             return false;
         }
@@ -184,6 +212,19 @@ impl App {
             self.completion = None;
             return;
         }
+        // An Enter waiting for the item's import lapses once the caret or
+        // the text moves, even if it comes back.
+        let now = self.cur().map(|doc| (doc.buffer.version(), doc.caret()));
+        if let Some(popup) = &mut self.completion
+            && popup
+                .accepting
+                .is_some_and(|(_, version, caret)| now != Some((version, caret)))
+        {
+            popup.accepting = None;
+        }
+        let Some(popup) = &self.completion else {
+            return;
+        };
         // The answer is still on its way; it gets filtered when it arrives.
         if !popup.loaded {
             return;
@@ -239,18 +280,13 @@ impl App {
         }
         let item = item.clone();
         popup.resolving.push(idx);
-        lsp::resolve_completion(
-            popup.client.clone(),
-            item,
-            popup.generation,
-            idx,
-            self.tx.clone(),
-        );
+        lsp::resolve_completion(popup.client.clone(), item, popup.list, idx, self.tx.clone());
     }
 
     /// Enter: put the selected item in, replacing the whole word around the
     /// caret, plus any import it needs, as one undo step.
     fn accept_completion(&mut self) {
+        let context = self.cur().map(|doc| (doc.buffer.version(), doc.caret()));
         let Some(popup) = &mut self.completion else {
             return;
         };
@@ -261,7 +297,7 @@ impl App {
             .get(idx)
             .is_some_and(|item| item.payload.is_some())
         {
-            popup.accepting = Some(idx);
+            popup.accepting = context.map(|(version, caret)| (idx, version, caret));
             self.resolve_selected();
             return;
         }
@@ -271,7 +307,9 @@ impl App {
         let Some(item) = popup.items.get(idx) else {
             return;
         };
-        let Some(doc) = self.cur_mut() else { return };
+        let Some(doc) = self.cur_mut().filter(|doc| doc.path == popup.path) else {
+            return;
+        };
         let caret = doc.caret();
         let start = item
             .edit

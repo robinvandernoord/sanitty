@@ -35,6 +35,8 @@ pub struct Find {
     /// Where the caret was when the bar opened; the first match is searched
     /// from here as you type.
     origin: LineCol,
+    /// The document (open instance, buffer version) `matches` were found in.
+    searched: Option<(u64, u64)>,
 }
 
 pub enum Outcome {
@@ -77,6 +79,7 @@ impl Find {
 
     /// Recompute matches for the current query and buffer.
     pub fn search(&mut self, doc: &Doc) {
+        self.searched = Some((doc.instance, doc.buffer.version()));
         self.matches.clear();
         self.current = None;
         self.invalid = false;
@@ -182,10 +185,12 @@ impl Find {
         let mut after = range.start;
         let added = u32::try_from(with.chars().count()).unwrap_or(u32::MAX);
         after.col = after.col.saturating_add(added);
-        doc.apply_edits(vec![TextEdit {
+        if !doc.apply_edits(vec![TextEdit {
             range,
             new_text: with,
-        }]);
+        }]) {
+            return;
+        }
         self.origin = after;
         self.search(doc);
         self.show(doc);
@@ -204,11 +209,13 @@ impl Find {
             })
             .collect();
         let count = edits.len();
-        if count > 0 {
-            doc.apply_edits(edits);
-        }
+        let replaced = if count > 0 && doc.apply_edits(edits) {
+            count
+        } else {
+            0
+        };
         self.search(doc);
-        count
+        replaced
     }
 
     /// Handle a key while the bar is open. `status` receives a message.
@@ -217,6 +224,20 @@ impl Find {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let mut research = false;
+        // The text changed under the bar (undo, a reformat, another file):
+        // find the matches again before anything uses their positions.
+        let stale = self.searched != Some((doc.instance, doc.buffer.version()));
+        if stale {
+            self.search(doc);
+        }
+        let replacing = (key.code == KeyCode::Enter && self.in_replace)
+            || (key.code == KeyCode::Char('a') && alt && self.replace.is_some());
+        if stale && replacing {
+            *status =
+                "The text changed, so the matches were updated; press again to replace".into();
+            self.show(doc);
+            return Outcome::Handled;
+        }
         match key.code {
             KeyCode::Esc => return Outcome::Close,
             KeyCode::Enter if self.in_replace => self.replace_current(doc),
@@ -294,5 +315,45 @@ impl Find {
                 Decoration::new(*range, DecorationKind::TextBackground, Some(role))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyModifiers;
+
+    use super::Find;
+    use crate::doc::Doc;
+
+    /// Replace never uses match positions from before the text changed: it
+    /// finds them again first, and replaces on the next key.
+    #[test]
+    fn replace_after_an_undo_uses_fresh_matches() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("sanitty-find-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "foo\n")?;
+        let mut doc = Doc::open(&path)?;
+        doc.type_text("x");
+        let mut find = Find::open(&doc, true, None);
+        let mut status = String::new();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for chr in "foo".chars() {
+            find.handle_key(&key(KeyCode::Char(chr)), &mut doc, &mut status);
+        }
+        find.handle_key(&key(KeyCode::Tab), &mut doc, &mut status);
+        for chr in "bar".chars() {
+            find.handle_key(&key(KeyCode::Char(chr)), &mut doc, &mut status);
+        }
+        // The match was found in "xfoo"; take the "x" back out.
+        doc.undo();
+        find.handle_key(&key(KeyCode::Enter), &mut doc, &mut status);
+        assert_eq!(doc.buffer.text(), "foo\n", "the first Enter only refreshes");
+        find.handle_key(&key(KeyCode::Enter), &mut doc, &mut status);
+        assert_eq!(doc.buffer.text(), "bar\n");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

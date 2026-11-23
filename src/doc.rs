@@ -2,6 +2,8 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -25,6 +27,12 @@ use karet_text::TextBuffer;
 
 pub struct Doc {
     pub path: PathBuf,
+    /// The buffer version right after loading: a higher one means edited
+    /// (even if saved since).
+    pub loaded_version: u64,
+    /// Unique for every time a file is opened, so a late answer about an
+    /// earlier copy of the same file is recognised.
+    pub instance: u64,
     pub buffer: TextBuffer,
     pub state: EditorState,
     pub highlights: Option<Highlights>,
@@ -53,13 +61,18 @@ pub struct Doc {
     highlighter: LayeredHighlighter,
 }
 
+/// Counts every file opened, for [`Doc::instance`].
+static INSTANCES: AtomicU64 = AtomicU64::new(0);
+
 impl Doc {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let buffer = TextBuffer::load(path)?;
         let lang = syntax_language(path);
         let mut doc = Self {
             path: path.to_path_buf(),
+            instance: INSTANCES.fetch_add(1, Ordering::Relaxed),
             lsp_synced: buffer.version(),
+            loaded_version: buffer.version(),
             buffer,
             state: EditorState::new(),
             highlights: None,
@@ -225,7 +238,13 @@ impl Doc {
     pub fn apply_edits(&mut self, edits: Vec<TextEdit>) -> bool {
         let change = Change::new(self.buffer.version(), edits);
         let caret = self.caret();
-        let Ok(applied) = self.buffer.apply_simple(&change) else {
+        // Undo puts the caret back where it was before these edits.
+        let ctx = EditContext {
+            tick_ms: Self::now_ms(),
+            cause: EditCause::Replace,
+            cursor_before: self.state.cursors().clone(),
+        };
+        let Ok(applied) = self.buffer.apply(&change, ctx) else {
             return false;
         };
         let clamped = self.buffer.clamp(caret);
@@ -570,6 +589,44 @@ fn to_u32(count: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Undoing several edits applied as one step (a completion with its
+    /// import) puts the caret back where it was.
+    #[test]
+    fn undoing_batch_edits_puts_the_caret_back() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("sanitty-undo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("a.py");
+        std::fs::write(&path, "import os\n\n\ndef f():\n    return Pa\n")?;
+        let mut doc = Doc::open(&path)?;
+        doc.goto(LineCol::new(4, 13));
+        // A completion with an import: two edits, one undo step.
+        let edits = vec![
+            TextEdit {
+                range: Range {
+                    start: LineCol::new(0, 0),
+                    end: LineCol::new(0, 0),
+                },
+                new_text: "from pathlib import Path\n".into(),
+            },
+            TextEdit {
+                range: Range {
+                    start: LineCol::new(4, 11),
+                    end: LineCol::new(4, 13),
+                },
+                new_text: "Path".into(),
+            },
+        ];
+        assert!(doc.apply_edits(edits));
+        doc.undo();
+        assert_eq!(
+            doc.buffer.text(),
+            "import os\n\n\ndef f():\n    return Pa\n"
+        );
+        assert_eq!(doc.caret(), LineCol::new(4, 13));
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 
     /// Incremental recolouring after edits (and their undo) must match what a
     /// fresh parse of the same text gives.

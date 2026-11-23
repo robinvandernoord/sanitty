@@ -39,6 +39,9 @@ use code::hover_summary;
 use code::one_line;
 use code::problem_texts;
 
+/// Each open file's (instance, buffer version), by path.
+type Snapshot = std::collections::HashMap<PathBuf, (u64, u64)>;
+
 enum Overlay {
     None,
     Picker(Picker),
@@ -102,6 +105,18 @@ pub struct App {
     completion: Option<crate::complete::Completion>,
     /// Bumped for every completion request; an older answer is dropped.
     completion_gen: u64,
+    /// The newest document version each server reported problems for, per
+    /// file.
+    problem_versions: std::collections::HashMap<(PathBuf, &'static str), i32>,
+    /// Each open file's (instance, buffer version) when the pending rename
+    /// was asked for.
+    /// Tagged with the request's id; an answer for another id is dropped.
+    rename_snapshot: Option<(u64, Snapshot)>,
+    /// Numbers rename requests.
+    rename_id: u64,
+    /// The last document version of each file closed, to continue from when
+    /// it opens again.
+    closed_versions: std::collections::HashMap<PathBuf, i32>,
     /// Launcher search generation; bumping it cancels older searches.
     search_gen: Arc<AtomicU64>,
     pub quit: bool,
@@ -145,6 +160,10 @@ impl App {
             hover_asked: None,
             problems: std::collections::HashMap::new(),
             problem_parts: std::collections::HashMap::new(),
+            problem_versions: std::collections::HashMap::new(),
+            closed_versions: std::collections::HashMap::new(),
+            rename_snapshot: None,
+            rename_id: 0,
             search_gen: Arc::new(AtomicU64::new(0)),
             quit: false,
             shell_requested: false,
@@ -184,8 +203,8 @@ impl App {
                 self.refresh_completion();
             }
             Event::Completions(generation, answer) => self.on_completions(generation, answer),
-            Event::CompletionResolved(generation, index, item) => {
-                self.on_completion_resolved(generation, index, item);
+            Event::CompletionResolved(list, index, item) => {
+                self.on_completion_resolved(list, index, item);
             }
             Event::Term(_) => {}
             Event::Files(files) => {
@@ -200,13 +219,19 @@ impl App {
             Event::Status(text) => self.status = text,
             Event::LspReady(key, client) => self.on_lsp_ready(key, client),
             Event::LspFailed(key, msg) => {
-                self.status.clone_from(&msg);
+                if !msg.is_empty() {
+                    self.status.clone_from(&msg);
+                }
                 self.lsp.failed(key, msg);
             }
-            Event::Diagnostics(key, path, diags) => self.on_diagnostics(key, path, diags),
+            Event::Diagnostics(key, path, version, related, diags) => {
+                self.on_diagnostics(key, path, (version, related), diags);
+            }
             Event::Locations(nav, locs) => self.on_locations(nav, locs),
-            Event::Rename(edit) => self.on_rename(edit),
-            Event::Formatted(path, version, edits) => self.on_formatted(&path, version, edits),
+            Event::Rename(id, edit) => self.on_rename(id, edit),
+            Event::Formatted(path, instance, version, edits) => {
+                self.on_formatted(&path, (instance, version), edits);
+            }
             Event::Launcher(generation, kind, items) => {
                 if generation == self.search_gen.load(Ordering::Relaxed)
                     && let Overlay::Picker(picker) = &mut self.overlay
@@ -220,25 +245,30 @@ impl App {
                 self.auto_hover();
             }
             Event::Semantic(path, version, tokens) => {
+                // Only for the text on screen: not after an edit the server
+                // has not been sent yet.
                 if let Some(doc) = self.docs.iter_mut().find(|doc| doc.path == path)
                     && doc.lsp_version == version
+                    && doc.lsp_synced == doc.buffer.version()
                 {
                     doc.semantic = tokens
                         .into_iter()
-                        .map(|token| {
+                        .filter_map(|token| {
+                            // A token running past the end of any line is
+                            // malformed; skip it.
+                            let end_col = token.start.col.checked_add(token.length)?;
                             let start = doc
                                 .buffer
                                 .utf16_to_line_col(token.start.line, token.start.col);
-                            let end = doc.buffer.utf16_to_line_col(
-                                token.start.line,
-                                token.start.col + token.length,
-                            );
-                            karet_core::Decoration::new(
-                                Range { start, end },
-                                karet_core::DecorationKind::TextStyle,
-                                None,
+                            let end = doc.buffer.utf16_to_line_col(token.start.line, end_col);
+                            Some(
+                                karet_core::Decoration::new(
+                                    Range { start, end },
+                                    karet_core::DecorationKind::TextStyle,
+                                    None,
+                                )
+                                .with_fg(token.token),
                             )
-                            .with_fg(token.token)
                         })
                         .collect();
                 }
@@ -251,8 +281,27 @@ impl App {
         &mut self,
         key: &'static str,
         path: PathBuf,
+        (version, related): (Option<i32>, bool),
         diags: Vec<karet_core::Diagnostic>,
     ) {
+        // A report about an older version than one already shown is stale.
+        // Problems a server mentions for another file in a pull answer carry
+        // no version: they do not replace a versioned report for an open
+        // file, which gets reports of its own.
+        let open = self.docs.iter().any(|doc| doc.path == path);
+        if related && open && self.problem_versions.contains_key(&(path.clone(), key)) {
+            return;
+        }
+        if let Some(version) = version {
+            let seen = self
+                .problem_versions
+                .entry((path.clone(), key))
+                .or_insert(version);
+            if version < *seen {
+                return;
+            }
+            *seen = version;
+        }
         // Each server replaces only its own report; the file shows all.
         let parts = self.problem_parts.entry(path.clone()).or_default();
         parts.insert(key, diags);
@@ -316,8 +365,9 @@ impl App {
                 let path = doc.path.clone();
                 self.status = format!("Saved {}", self.rel(&path).display());
                 self.sync_lsp();
+                let version = self.cur().map_or(0, |doc| doc.lsp_version);
                 for server in servers {
-                    lsp::did_save(server, path.clone(), self.tx.clone());
+                    lsp::did_save(server, path.clone(), version, self.tx.clone());
                 }
             }
             Err(err) => self.status = format!("Save failed: {err}"),
