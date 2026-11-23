@@ -22,11 +22,12 @@ Three top-level views, each taking the whole screen.
 
 | View     | Key     | Purpose                                      |
 |----------|---------|----------------------------------------------|
-| Code     | `Alt+C` | Editing and navigation (default)             |
-| Review   | `Alt+R` | Diffs and review comments                    |
-| Database | `Alt+D` | Schema, queries, result grids, row editing   |
+| Code     |         | Editing and navigation (default)             |
+| Review   | `Alt+9` | Diffs and review comments                    |
+| Database | (later) | Schema, queries, result grids, row editing   |
 
-Like all bindings, these are defaults to tweak after real use.
+A view's key opens it and, pressed again, goes back to the code. The Database key is
+chosen in milestone 4 (Alt+D, planned earlier, is now Duplicate Line).
 
 ### Code view
 
@@ -72,24 +73,51 @@ Popups over the Code view:
 
 ### Review view
 
-tuicr-like: a list of changed files, a diff, line comments, and export.
+A list of changed files, a diff, line comments, and export. Read-only: nothing is edited
+here.
 
 ```
- [Review]  working tree vs HEAD  (3 files, +41 -12)
-+- files ------------++- apps/shop/models.py ------------------ side-by-side -+
-| v models.py   +12  || 40   def total(self):        | 40   def total(self):  |
-|   views.py    +27  || 41 -     return sum(...)     | 41 +     return sum(   |
-|   urls.py      +2  ||                              | 42 +       l.price ... |
-|                    ||   [issue] use Decimal here                            |
-+--------------------++- c comment  v viewed  \ inline/split  ]/[ next file --+
+ Review   working tree vs HEAD   3 files  +41 -12   2 comments
++- files ------------++- apps/shop/models.py ----------------------- split -+
+| v models.py   +12  || 40   def total(self):      | 40   def total(self):  |
+|   views.py    +27  || 41 -     return sum(...)   | 41 +     return sum(   |
+|   urls.py      +2  ||                            | 42 +       l.price ... |
+|                    ||  [issue] use Decimal here, floats round wrong        |
++--------------------++------------------------------------------------------+
+ c Comment  v Viewed  \ Split/inline  ] [ File  y Copy review  Alt+9 Code
 ```
 
-- Sources: working tree vs HEAD, branch vs main, a single commit, a GitHub PR (via `gh`).
+- Opening: `Alt+9` shows the source picker the first time, then the last source; `s`
+  picks another. The same key goes back to the code.
+- Sources, in order: working tree vs HEAD and this branch vs main first; a single commit
+  and a GitHub PR (via `gh`) later in the milestone.
 - Layout: side-by-side, switching to inline when the terminal is narrow; `\` toggles.
-- Comments on a line or range, typed as issue / suggestion / note / praise.
-- Export: the whole review is copied to the clipboard as Markdown (OSC 52, works over
-  SSH), ready to paste into Claude.
-- Viewed-file marks persist per source in `.sanitty/review-state.json`.
+- Keys inside the view are plain letters (nothing is typed into a diff): Up/Down move,
+  Tab switches between the file list and the diff, Shift+Up/Down select a range,
+  `c` comments on the line or range, Enter on a comment edits it, `d` deletes it, `v`
+  marks the file viewed, `]`/`[` go to the next/previous file, `y` copies the review,
+  `x` clears all comments (asks first). Enter on a diff line does nothing.
+- Comments on a line or range, typed as issue / suggestion / note / praise (Tab cycles
+  the type in the comment box).
+- Export (`y`): the whole review as Markdown to the clipboard (OSC 52, works over SSH),
+  grouped by file, each comment with the diff lines it is about:
+
+  ````
+  ## apps/shop/models.py
+
+  **issue** (lines 41-42): use Decimal here, floats round wrong
+
+  ```diff
+  -     return sum(...)
+  +     return sum(
+  +       l.price ...
+  ```
+  ````
+- Comments and viewed marks are kept across restarts until the review is cleared. A
+  comment stays on its line while that line's text is still in the diff.
+- State lives outside the project, in `~/.local/state/sanitty/`, one file per
+  repository (both sources, and which one was used last), so nothing shows up in the
+  repo.
 
 ### Database view
 
@@ -181,6 +209,7 @@ key check (`sanitty --check-keys`, 2026-11-19).
 | Go to line               | `Alt+G`          |
 | Recent files             | `Alt+E` (`Enter` = previous file) |
 | Project tree             | `Alt+1`          |
+| Review view (and back)   | `Alt+9`          |
 | Navigate back / forward  | `Alt+,` / `Alt+.` |
 | Find in file             | `Ctrl+F`         |
 | Replace in file          | `Alt+R`          |
@@ -213,10 +242,10 @@ them. Inside the find bar, `Alt+C` / `Alt+W` / `Alt+X` toggle case, words and re
 
 ### Free keys
 
-129 keys arrive in both terminals and are bound to nothing; these are the pool for new
+128 keys arrive in both terminals and are bound to nothing; these are the pool for new
 bindings. Prefer Alt, then Ctrl+Alt.
 
-- Alt: 2, 3, 4, 5, 7, 8, 9, 0, `-`, `=`, Backspace; U, O, P, `[`, `]`, `\`; A, `;`, `'`,
+- Alt: 2, 3, 4, 5, 7, 8, 0, `-`, `=`, Backspace; U, O, P, `[`, `]`, `\`; A, `;`, `'`,
   Enter (planned: run SQL); X, C, V, M; Up, Down
 - Ctrl+Alt: Q, W, E, R, T, Y, U, I, O, P; S, D, F, G, H, J, K, L; Z, X, C, V, N, M;
   Shift+N; Up, Down, Left, Right
@@ -258,7 +287,7 @@ One Rust binary.
 - Own code: views, popups, keymap, config, review model, compose discovery.
 
 Config lives in `~/.config/sanitty/` (keymap, theme, settings) and per project in
-`.sanitty/` (db connections, review state).
+`.sanitty/` (db connections). Review state lives in `~/.local/state/sanitty/`.
 
 ## Milestones
 
@@ -271,7 +300,10 @@ Config lives in `~/.config/sanitty/` (keymap, theme, settings) and per project i
    Known limit: Rust files of several MB with doc
    comments still take about 0.5 s per keystroke (karet rebuilds embedded layers on
    every edit).
-3. **Review**: Review view, sources, comments, Markdown export.
+3. **Review** (started): the Review view with your changes and this branch vs main as
+   sources, split and inline diffs, line and range comments, viewed marks, Markdown
+   export, state kept between runs. Remaining: a single commit and a GitHub PR as
+   sources.
 4. **Database**: compose discovery, schema tree, query editor, result grid, confirmed
    writes, `Alt+Enter` from `.sql` files.
 5. **Polish**: search in files, multi-caret, VS Code theme loading, settings file.

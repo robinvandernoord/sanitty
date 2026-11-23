@@ -416,7 +416,7 @@ impl Picker {
             KeyCode::PageUp => self.list.scroll_up_by(10),
             KeyCode::PageDown => self.list.scroll_down_by(10),
             KeyCode::Backspace => {
-                self.query.pop();
+                erase(&mut self.query, key);
                 self.changed = true;
                 self.refilter();
             }
@@ -737,6 +737,29 @@ impl Picker {
 }
 
 /// At most `max` chars, ending in `...` when cut.
+/// Backspace in a one-line text field: the last character, or with Ctrl or
+/// Alt the last word (and the spaces after it).
+pub fn erase(text: &mut String, key: &KeyEvent) {
+    if !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        text.pop();
+        return;
+    }
+    let trimmed = text.trim_end().len();
+    text.truncate(trimmed);
+    let word = |chr: char| chr.is_alphanumeric() || chr == '_';
+    let in_word = text.chars().next_back().is_some_and(word);
+    while text
+        .chars()
+        .next_back()
+        .is_some_and(|chr| !chr.is_whitespace() && word(chr) == in_word)
+    {
+        text.pop();
+    }
+}
+
 pub fn keep_start(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -811,6 +834,21 @@ mod tests {
     fn synonyms_find_actions() -> TestResult {
         assert_eq!(first("jump to source")?, "Go to Definition (or Usages)");
         Ok(())
+    }
+
+    #[test]
+    fn alt_backspace_deletes_a_word() {
+        let alt = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+        let plain = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        let mut text = String::from("go to file.rs  ");
+        erase(&mut text, &alt);
+        assert_eq!(text, "go to file.");
+        erase(&mut text, &alt);
+        assert_eq!(text, "go to file");
+        erase(&mut text, &plain);
+        assert_eq!(text, "go to fil");
+        erase(&mut text, &alt);
+        assert_eq!(text, "go to ");
     }
 
     #[test]

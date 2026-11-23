@@ -76,7 +76,7 @@ impl AllKeys {
             KeyCode::PageUp => self.selected = self.selected.saturating_sub(10),
             KeyCode::PageDown => self.selected = (self.selected + 10).min(count.saturating_sub(1)),
             KeyCode::Backspace => {
-                self.query.pop();
+                crate::picker::erase(&mut self.query, key);
                 self.selected = 0;
             }
             KeyCode::Char(chr) if !ctrl => {

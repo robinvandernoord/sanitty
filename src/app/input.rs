@@ -26,6 +26,7 @@ use crate::picker::Target;
 
 use super::App;
 use super::Overlay;
+use super::Request;
 use super::file_name;
 use super::parent_dir;
 use super::save_keycheck;
@@ -33,6 +34,12 @@ use super::visible;
 
 impl App {
     pub(super) fn on_paste(&mut self, text: &str) {
+        if self.in_review && matches!(self.overlay, Overlay::None) {
+            if let Some(review) = &mut self.review {
+                review.paste(text);
+            }
+            return;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         match &mut self.overlay {
             Overlay::Rename { text: name, .. } => name.push_str(text.lines().next().unwrap_or("")),
@@ -62,6 +69,9 @@ impl App {
         self.status.clear();
         self.armed = self.confirm.take();
         let action = self.keymap.lookup(&key);
+        if self.review_key(&key, action) {
+            return;
+        }
         if self.completion_key(&key, action) {
             return;
         }
@@ -141,6 +151,13 @@ impl App {
             self.close_overlay();
             return;
         }
+        // Keys that open another view or search still work over the tree
+        // (it is also the home screen).
+        if let Some(action) = action.filter(|action| leaves_overlay(*action)) {
+            self.close_overlay();
+            self.run(action);
+            return;
+        }
         let Overlay::Explorer(explorer) = &mut self.overlay else {
             return;
         };
@@ -155,21 +172,9 @@ impl App {
     }
 
     fn picker_overlay_key(&mut self, key: &KeyEvent, action: Option<Action>) {
-        if matches!(
-            action,
-            Some(
-                Action::Launcher
-                    | Action::GotoFile
-                    | Action::GotoSymbol
-                    | Action::GotoLine
-                    | Action::SearchInFiles
-                    | Action::RecentFiles
-                    | Action::AllKeys
-                    | Action::Quit
-            )
-        ) {
+        if let Some(action) = action.filter(|action| leaves_overlay(*action)) {
             self.overlay = Overlay::None;
-            self.run(action.unwrap_or(Action::None));
+            self.run(action);
             return;
         }
         let Overlay::Picker(picker) = &mut self.overlay else {
@@ -200,9 +205,7 @@ impl App {
                 self.overlay = Overlay::None;
                 self.request_rename(path, pos, name);
             }
-            KeyCode::Backspace => {
-                text.pop();
-            }
+            KeyCode::Backspace => crate::picker::erase(text, key),
             KeyCode::Char(chr) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 text.push(chr);
             }
@@ -272,7 +275,8 @@ impl App {
             KeyCode::Esc => doc.state.collapse_to_primary(),
             KeyCode::Enter => doc.newline(),
             KeyCode::Tab => doc.type_text("    "),
-            KeyCode::Backspace => doc.backspace(ctrl),
+            // Ctrl or Alt: the word before the caret.
+            KeyCode::Backspace => doc.backspace(ctrl || alt),
             KeyCode::Delete => doc.delete(ctrl),
             KeyCode::Char(chr) if !ctrl && !alt => {
                 let mut utf8 = [0u8; 4];
@@ -305,6 +309,7 @@ impl App {
             Action::Find | Action::Replace => self.open_find_bar(action == Action::Replace),
             Action::FindNext | Action::FindPrev => self.find_step(action == Action::FindNext),
             Action::RecentFiles => self.show_recent_files(),
+            Action::Review => self.toggle_review(),
             Action::ToggleExplorer => self.open_tree(),
             Action::GotoDefinition => self.request_nav(Nav::Definition),
             Action::QuickDoc => self.request_hover(true),
@@ -355,7 +360,7 @@ impl App {
                     self.open(&path, Some(pos));
                 }
             }
-            Action::Shell => self.shell_requested = true,
+            Action::Shell => self.request = Some(Request::Shell),
         }
     }
 
@@ -367,7 +372,7 @@ impl App {
             .map(|doc| self.rel(&doc.path).display().to_string())
             .collect();
         if dirty.is_empty() || self.armed == Some(Action::Quit) {
-            self.quit = true;
+            self.request = Some(Request::Quit);
         } else {
             self.status = format!(
                 "Unsaved: {}. Press quit again to discard.",
@@ -456,7 +461,9 @@ impl App {
     /// `PyCharm`'s line copy.
     fn copy_or_leave(&mut self) {
         match self.cur().and_then(Doc::selected_text) {
-            Some(text) => self.set_clipboard(text),
+            Some(text) => {
+                self.set_clipboard(text);
+            }
             None if self.cur().is_some() => {
                 // Home, with the tree open on the file just left.
                 self.open_tree();
@@ -534,4 +541,21 @@ impl App {
             None => self.status = "No previous file".into(),
         }
     }
+}
+
+/// Actions that close a popup (picker, tree) and run instead of going to it.
+fn leaves_overlay(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Launcher
+            | Action::GotoFile
+            | Action::GotoSymbol
+            | Action::GotoLine
+            | Action::SearchInFiles
+            | Action::RecentFiles
+            | Action::Review
+            | Action::Shell
+            | Action::AllKeys
+            | Action::Quit
+    )
 }

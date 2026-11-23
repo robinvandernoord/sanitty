@@ -542,6 +542,17 @@ impl Doc {
     }
 }
 
+/// Syntax colours for a whole text that is not open as a document (the two
+/// sides of a reviewed file): the same highlighting a document gets.
+pub fn highlight_text(path: &Path, text: &str) -> Option<Highlights> {
+    if crate::tshl::handles(path) {
+        return crate::tshl::highlight(text, path);
+    }
+    let lang = syntax_language(path)?;
+    let tree = LayeredParser::new().parse(lang, text).ok()?;
+    Some(LayeredHighlighter::new().highlight(&tree, text))
+}
+
 /// The tree-sitter grammar for a path. SCSS and Less use the CSS grammar:
 /// their own highlight rules in karet colour almost nothing, while the CSS
 /// grammar handles the CSS that most of their lines are.

@@ -10,11 +10,12 @@ sanitty is a non-modal IDE written in Rust that runs entirely in the terminal. J
 - Find and replace in the current file, or search across the project with Find in Files.
 - Language servers provide definition and implementation jumps, usages, rename, problems, quick documentation, formatting and completion. Completion applies auto-imports when the server supplies them.
 - Tree-sitter syntax highlighting (edits reparse only what changed, except in TypeScript), rainbow columns for CSV and TSV, and colour swatches next to colour values in style files.
+- A Review view (`Alt+9`) for your uncommitted changes or this branch against main: a side-by-side or inline diff, comments on lines and ranges, viewed marks, and the whole review copied to the clipboard as Markdown. Comments are kept between runs, outside the project.
 - Check Keys records which shortcuts reach sanitty.
 
 ## Status
 
-sanitty is an early personal project. The editor and language-server milestones are complete. The review view, database view, multi-caret editing and a settings file are planned. See [PLAN.md](PLAN.md).
+sanitty is an early personal project. The editor and language-server milestones are complete, and the review view is in progress. The database view, multi-caret editing and a settings file are planned. See [PLAN.md](PLAN.md).
 
 ## Build and run
 
@@ -48,6 +49,7 @@ In Recent Files, `Enter` opens the preselected previous file. Copy Line and Chec
 | | Go to Symbol | `Alt+S` |
 | | Go to Line | `Alt+G` |
 | | Recent Files | `Alt+E` |
+| | Review Changes | `Alt+9` |
 | | Project Tree | `Alt+1` |
 | | Navigate Back | `Alt+,` |
 | | Navigate Forward | `Alt+.` |
@@ -89,7 +91,7 @@ The default keys were tested in Ghostty and T3 Code's terminal. Launch sanitty w
 
 ## Configuration
 
-On Linux, sanitty uses `$XDG_CONFIG_HOME/sanitty`, with `~/.config/sanitty` as the default. Override shortcuts in `keymap.toml`. For example, to move Go to Definition from `Alt+B` to `F12`:
+On Linux, sanitty uses `$XDG_CONFIG_HOME/sanitty`, with `~/.config/sanitty` as the default. Put a JSON colour theme in `theme.json` (the common editor theme format, with `colors` and `tokenColors`; unknown keys fall back to the built-in dark theme), or override shortcuts in `keymap.toml`. For example, to move Go to Definition from `Alt+B` to `F12`:
 
 ```toml
 [bindings]

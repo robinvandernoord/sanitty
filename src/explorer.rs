@@ -248,7 +248,7 @@ impl Explorer {
             KeyCode::Esc if searching => self.query.clear(),
             KeyCode::Esc => return Outcome::Close,
             KeyCode::Backspace => {
-                self.query.pop();
+                crate::picker::erase(&mut self.query, key);
                 self.search();
             }
             KeyCode::Up if searching => self.step_match(false),

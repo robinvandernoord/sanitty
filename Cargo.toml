@@ -2,7 +2,7 @@
 name = "sanitty"
 version = "0.1.0"
 edition = "2024"
-description = "A PyCharm-flavoured terminal IDE built on the karet-* crates"
+description = "A little sanity for your tty: a non-modal IDE for the terminal"
 license = "MIT"
 
 [[bin]]
@@ -13,7 +13,7 @@ path = "src/main.rs"
 karet-core = "0.8.0"
 karet-text = "0.8.0"
 karet-editor = "0.8.0"
-karet-theme = { version = "0.8.0", features = ["view"] }
+karet-theme = { version = "0.8.0", features = ["view", "vscode"] }
 karet-syntax = { version = "0.8.0", features = [
     "lang-python", "lang-rust", "lang-typescript", "lang-javascript", "lang-json",
     "lang-toml", "lang-yaml", "lang-markdown", "lang-sql", "lang-html", "lang-css",
@@ -37,6 +37,7 @@ streaming-iterator = "0.1.9"
 toml = "0.9"
 anyhow = "1"
 dirs = "6"
+karet-diff = "0.8.0"
 
 # karet-lsp 0.8.0 with two fixes (see vendor/karet-lsp/SANITTY-PATCH.md).
 [patch.crates-io]

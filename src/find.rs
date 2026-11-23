@@ -15,20 +15,22 @@ use karet_search::SearchQuery;
 
 use crate::doc::Doc;
 
+/// How the query matches: the Alt+C / Alt+W / Alt+X toggles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    pub case: bool,
+    pub word: bool,
+    pub regex: bool,
+}
+
 #[derive(Default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent search toggles read directly by the view; grouping them would change pub fields"
-)]
 pub struct Find {
     pub query: String,
     /// The replacement text, when the replace field is shown.
     pub replace: Option<String>,
     /// Whether typing goes into the replace field.
     pub in_replace: bool,
-    pub case: bool,
-    pub word: bool,
-    pub regex: bool,
+    pub options: Options,
     pub matches: Vec<Range>,
     pub current: Option<usize>,
     pub invalid: bool,
@@ -56,9 +58,7 @@ impl Find {
         };
         if let Some(prev) = previous {
             find.query.clone_from(&prev.query);
-            find.case = prev.case;
-            find.word = prev.word;
-            find.regex = prev.regex;
+            find.options = prev.options;
         }
         // A single-line selection seeds the query, as in PyCharm.
         if let Some(sel) = doc.selected_text().filter(|text| !text.contains('\n')) {
@@ -88,10 +88,10 @@ impl Find {
         }
         let query = SearchQuery {
             pattern: self.query.clone(),
-            regex: self.regex,
+            regex: self.options.regex,
             // Smart case: an uppercase letter makes it case-sensitive.
-            case_sensitive: self.case || self.query.chars().any(char::is_uppercase),
-            whole_word: self.word,
+            case_sensitive: self.options.case || self.query.chars().any(char::is_uppercase),
+            whole_word: self.options.word,
             ..Default::default()
         };
         let Ok(matcher) = Matcher::new(&query) else {
@@ -249,15 +249,15 @@ impl Find {
                 self.in_replace = !self.in_replace;
             }
             KeyCode::Char('c') if alt => {
-                self.case = !self.case;
+                self.options.case = !self.options.case;
                 research = true;
             }
             KeyCode::Char('w') if alt => {
-                self.word = !self.word;
+                self.options.word = !self.options.word;
                 research = true;
             }
             KeyCode::Char('x') if alt => {
-                self.regex = !self.regex;
+                self.options.regex = !self.options.regex;
                 research = true;
             }
             KeyCode::Char('a') if alt && self.replace.is_some() => {
@@ -265,7 +265,7 @@ impl Find {
                 *status = format!("Replaced {count} occurrence(s)");
             }
             KeyCode::Backspace => {
-                self.field().pop();
+                crate::picker::erase(self.field(), key);
                 research = !self.in_replace;
             }
             KeyCode::Char('u') if ctrl => {

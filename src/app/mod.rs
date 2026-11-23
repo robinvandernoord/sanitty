@@ -30,6 +30,7 @@ mod code;
 mod completion;
 mod input;
 mod navigate;
+mod review;
 mod view;
 
 pub(crate) use view::doc_lines;
@@ -58,10 +59,14 @@ enum Overlay {
     Doc(String),
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent flags read by main.rs and the other app modules; not a state machine"
-)]
+/// Something the app asks the main loop to do after handling an event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request {
+    Quit,
+    /// Suspend into a shell (Alt+T) and come back.
+    Shell,
+}
+
 pub struct App {
     pub root: PathBuf,
     docs: Vec<Doc>,
@@ -119,8 +124,12 @@ pub struct App {
     closed_versions: std::collections::HashMap<PathBuf, i32>,
     /// Launcher search generation; bumping it cancels older searches.
     search_gen: Arc<AtomicU64>,
-    pub quit: bool,
-    pub shell_requested: bool,
+    /// The Review view's state, kept while switching back to the code.
+    review: Option<crate::review::Review>,
+    /// The Review view is on screen.
+    in_review: bool,
+    /// What the main loop should do next, if anything.
+    pub request: Option<Request>,
     /// Whether the terminal speaks the kitty keyboard protocol.
     pub enhanced_keys: bool,
 }
@@ -165,8 +174,9 @@ impl App {
             rename_snapshot: None,
             rename_id: 0,
             search_gen: Arc::new(AtomicU64::new(0)),
-            quit: false,
-            shell_requested: false,
+            request: None,
+            review: None,
+            in_review: false,
             enhanced_keys: false,
         }
     }
@@ -203,6 +213,16 @@ impl App {
                 self.refresh_completion();
             }
             Event::Completions(generation, answer) => self.on_completions(generation, answer),
+            Event::ReviewSources(sources) => {
+                if let Some(review) = &mut self.review {
+                    review.pick(sources);
+                }
+            }
+            Event::ReviewLoaded(result) => {
+                if let Some(review) = &mut self.review {
+                    review.loaded(result);
+                }
+            }
             Event::CompletionResolved(list, index, item) => {
                 self.on_completion_resolved(list, index, item);
             }
@@ -348,9 +368,10 @@ impl App {
             .map(|doc| (doc.path.clone(), doc.caret()))
     }
 
-    fn set_clipboard(&mut self, text: String) {
-        crate::osc52_copy(&text);
+    fn set_clipboard(&mut self, text: String) -> crate::clipboard::Via {
+        let via = crate::clipboard::copy(&text);
         self.clipboard = text;
+        via
     }
 
     fn save(&mut self) {

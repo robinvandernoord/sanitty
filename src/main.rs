@@ -2,6 +2,7 @@
 
 mod allkeys;
 mod app;
+mod clipboard;
 mod colors;
 mod complete;
 mod csv;
@@ -13,6 +14,7 @@ mod keymap;
 mod lsp;
 mod markdown;
 mod picker;
+mod review;
 mod search;
 mod sig;
 mod stylenav;
@@ -79,6 +81,10 @@ pub enum Event {
     Semantic(PathBuf, i32, Vec<karet_core::SemanticToken>),
     /// Async launcher results: search generation, kind, items.
     Launcher(u64, picker::Kind, Vec<picker::Item>),
+    /// The sources the Review view can show, for its picker.
+    ReviewSources(Vec<review::git::SourceInfo>),
+    /// A diff for the Review view, or why it could not be loaded.
+    ReviewLoaded(Result<review::git::Loaded, String>),
     Tick,
 }
 
@@ -99,31 +105,6 @@ pub fn debug_log(line: &str) {
 #[must_use]
 pub fn config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("sanitty"))
-}
-
-/// Copy to the system clipboard through the terminal (OSC 52), which works over
-/// SSH in Ghostty without any clipboard daemon on the remote side.
-pub fn osc52_copy(text: &str) {
-    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let byte_at = |idx: usize| u32::from(chunk.get(idx).copied().unwrap_or(0));
-        let triple = (byte_at(0) << 16) | (byte_at(1) << 8) | byte_at(2);
-        // Four 6-bit groups, high to low; a short chunk pads the missing ones.
-        for (pos, shift) in [18_u32, 12, 6, 0].into_iter().enumerate() {
-            let digit = usize::try_from((triple >> shift) & 63)
-                .ok()
-                .and_then(|sextet| B64.get(sextet));
-            match digit {
-                Some(&digit) if pos <= chunk.len() => out.push(char::from(digit)),
-                _ => out.push('='),
-            }
-        }
-    }
-    let mut stdout = std::io::stdout();
-    let _ = write!(stdout, "\x1b]52;c;{out}\x07");
-    let _ = stdout.flush();
 }
 
 /// The workspace root for a path: the enclosing git repository, else the
@@ -314,13 +295,13 @@ async fn main() -> anyhow::Result<()> {
             while let Ok(queued) = rx.try_recv() {
                 app.handle(queued);
             }
-            if app.shell_requested {
-                app.shell_requested = false;
-                run_shell(&app.root, enhanced, &paused);
-                term.clear()?;
-            }
-            if app.quit {
-                break;
+            match app.request.take() {
+                Some(app::Request::Shell) => {
+                    run_shell(&app.root, enhanced, &paused);
+                    term.clear()?;
+                }
+                Some(app::Request::Quit) => break,
+                None => {}
             }
         }
         Ok(())

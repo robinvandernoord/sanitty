@@ -47,8 +47,14 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(area);
-        self.render_top(frame, top);
-        self.render_editor(frame, body);
+        if self.in_review
+            && let Some(review) = &mut self.review
+        {
+            review.render(frame, top, body, &self.theme);
+        } else {
+            self.render_top(frame, top);
+            self.render_editor(frame, body);
+        }
         self.render_status(frame, status);
         self.render_hints(frame, hints);
         self.render_overlay(frame, body, find_area);
@@ -145,6 +151,18 @@ impl App {
     /// The nano-style line of keys for whatever has focus right now.
     pub(super) fn hints(&self) -> Vec<(String, &'static str)> {
         let key = |action: Action| self.display_key(action);
+        if self.in_review
+            && matches!(self.overlay, Overlay::None)
+            && let Some(review) = &self.review
+        {
+            let mut shown: Vec<(String, &'static str)> = review
+                .hints()
+                .into_iter()
+                .map(|(keys, label)| (keys.to_string(), label))
+                .collect();
+            shown.push((key(Action::Review), "Code"));
+            return shown;
+        }
         if self.completion.is_some() && matches!(self.overlay, Overlay::None) {
             return vec![
                 hint("Enter", "Insert"),
@@ -216,11 +234,29 @@ impl App {
         } else {
             vec![hint("Enter", "Next"), hint(prev, "Previous")]
         };
-        shown.push(hint("Alt+C", if find.case { "Case: on" } else { "Case" }));
-        shown.push(hint("Alt+W", if find.word { "Words: on" } else { "Words" }));
+        shown.push(hint(
+            "Alt+C",
+            if find.options.case {
+                "Case: on"
+            } else {
+                "Case"
+            },
+        ));
+        shown.push(hint(
+            "Alt+W",
+            if find.options.word {
+                "Words: on"
+            } else {
+                "Words"
+            },
+        ));
         shown.push(hint(
             "Alt+X",
-            if find.regex { "Regex: on" } else { "Regex" },
+            if find.options.regex {
+                "Regex: on"
+            } else {
+                "Regex"
+            },
         ));
         if find.replace.is_none() {
             shown.push((self.display_key(Action::Replace), "Replace"));
@@ -577,11 +613,15 @@ pub(super) fn render_find(frame: &mut Frame, area: Rect, find: &Find, theme: &Th
             find.matches.len()
         )
     };
-    let flags: String = [(find.case, "Aa"), (find.word, "W"), (find.regex, ".*")]
-        .iter()
-        .filter(|(enabled, _)| *enabled)
-        .flat_map(|(_, flag)| [" [", *flag, "]"])
-        .collect();
+    let flags: String = [
+        (find.options.case, "Aa"),
+        (find.options.word, "W"),
+        (find.options.regex, ".*"),
+    ]
+    .iter()
+    .filter(|(enabled, _)| *enabled)
+    .flat_map(|(_, flag)| [" [", *flag, "]"])
+    .collect();
     let find_line = Line::from(vec![
         Span::raw(" Find:    "),
         Span::raw(find.query.clone()),
