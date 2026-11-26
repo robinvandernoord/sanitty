@@ -66,7 +66,7 @@ Language servers are optional and installed separately on the machine running sa
 
 | Language | Server |
 | --- | --- |
-| Python | `ty`, plus `ruff` for lint warnings and formatting: installed in the project (`uv add --dev ty ruff`) or for your user (`uv tool install ty`). sanitty looks in the project's venv (`VIRTUAL_ENV`, else `.venv` or `venv` in the project) first, then on `PATH`, and runs the server in that venv either way, so it sees the project's dependencies. When `ty` is not installed, sanitty uses the first of `basedpyright-langserver`, `pyright-langserver` and `pylsp` it finds. `settings.toml` can prefer another server or turn ruff off. |
+| Python | `ty`, plus `ruff` for lint warnings and formatting: installed in the project (`uv add --dev ty ruff`) or for your user (`uv tool install ty`). sanitty looks in the project's venv first (`VIRTUAL_ENV`, else `UV_PROJECT_ENVIRONMENT`, else the venv in the project root whatever its name, preferring `.venv` and `venv`), then on `PATH`, and runs the server in that venv either way, so it sees the project's dependencies. When `ty` is not installed, sanitty uses the first of `basedpyright-langserver`, `pyright-langserver` and `pylsp` it finds. `settings.toml` can prefer another server or turn ruff off. |
 | Rust | `rust-analyzer` (`rustup component add rust-analyzer`). |
 | TypeScript and JavaScript | TypeScript 7 or newer: `node_modules/.bin/tsc` in the workspace (`npm install -D typescript@7`), else `tsc` on `PATH`. Older TypeScript works through `typescript-language-server` on `PATH`. |
 

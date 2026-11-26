@@ -180,19 +180,49 @@ fn server_key(lang: &str) -> &'static str {
     }
 }
 
-/// The project's Python environment: `VIRTUAL_ENV` when set, else a
-/// `.venv` or `venv` in the workspace root (a directory with `pyvenv.cfg`).
+/// The project's Python environment, the first of:
+/// 1. `VIRTUAL_ENV` (an activated venv);
+/// 2. `UV_PROJECT_ENVIRONMENT` (where uv keeps it; relative to the workspace);
+/// 3. the one directory directly in the workspace root that is a venv,
+///    whatever its name;
+/// 4. `.venv`, then `venv`, when that finds none or several (and with
+///    several but neither name, the first by name).
+///
+/// A venv is a directory with a `pyvenv.cfg`.
 pub fn project_venv(root: &Path) -> Option<PathBuf> {
-    let is_venv = |dir: &Path| dir.join("pyvenv.cfg").is_file();
-    std::env::var_os("VIRTUAL_ENV")
-        .map(PathBuf::from)
-        .filter(|dir| is_venv(dir))
-        .or_else(|| {
-            [".venv", "venv"]
-                .iter()
-                .map(|name| root.join(name))
-                .find(|dir| is_venv(dir))
-        })
+    let from_env = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(|value| root.join(value))
+            .filter(|dir| is_venv(dir))
+    };
+    from_env("VIRTUAL_ENV")
+        .or_else(|| from_env("UV_PROJECT_ENVIRONMENT"))
+        .or_else(|| venv_in(root))
+}
+
+fn is_venv(dir: &Path) -> bool {
+    dir.join("pyvenv.cfg").is_file()
+}
+
+/// The venv directly in `root` (see [`project_venv`], steps 3 and 4).
+fn venv_in(root: &Path) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(root).map_or_default(|entries| {
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|dir| is_venv(dir))
+            .collect()
+    });
+    found.sort();
+    if let [only] = found.as_slice() {
+        return Some(only.clone());
+    }
+    [".venv", "venv"]
+        .iter()
+        .map(|name| root.join(name))
+        .find(|dir| is_venv(dir))
+        .or_else(|| found.into_iter().next())
 }
 
 /// A server started in `venv`, as `activate` would: `VIRTUAL_ENV` set and
@@ -933,6 +963,36 @@ pub type Edit = WorkspaceEdit;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The venv in a workspace: the only one, whatever its name; `.venv` or
+    /// `venv` among several; else the first by name.
+    #[test]
+    fn finds_the_venv_in_the_workspace() -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join(format!("sanitty-venvs-{}", std::process::id()));
+        let make = |root: &Path, names: &[&str]| -> std::io::Result<()> {
+            std::fs::create_dir_all(root)?;
+            for name in names {
+                std::fs::create_dir_all(root.join(name))?;
+                std::fs::write(root.join(name).join("pyvenv.cfg"), "")?;
+            }
+            // Not a venv: no pyvenv.cfg.
+            std::fs::create_dir_all(root.join("src"))
+        };
+        let cases: &[(&str, &[&str], Option<&str>)] = &[
+            ("one", &["env"], Some("env")),
+            ("dotvenv", &["other", ".venv"], Some(".venv")),
+            ("plain", &["other", "venv"], Some("venv")),
+            ("several", &["b-env", "a-env"], Some("a-env")),
+            ("none", &[], None),
+        ];
+        for (case, names, want) in cases {
+            let root = base.join(case);
+            make(&root, names)?;
+            assert_eq!(venv_in(&root), want.map(|name| root.join(name)), "{case}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
 
     /// A server installed in the project's `.venv` is used, and started in
     /// that environment.

@@ -368,7 +368,8 @@ One Rust binary.
   else the `tsc` on PATH, e.g. from `bun i -g typescript`), with
   typescript-language-server as the fallback for older TypeScript (pointed at a global
   `tsserver.js` when the project has none). No `package.json` is needed. Servers run on the host with the project's own venv: a Python server (and ruff) installed in it
-  (`VIRTUAL_ENV`, else `.venv` or `venv` in the workspace) wins over one on PATH, and either runs with
+  (`VIRTUAL_ENV`, else `UV_PROJECT_ENVIRONMENT`, else the one venv directly in the workspace root
+  whatever its name, with `.venv` and `venv` preferred among several) wins over one on PATH, and either runs with
   that venv activated (`VIRTUAL_ENV` set, its `bin` first on PATH), so imports resolve to the project's
   packages.
 - `karet-diff` (with its `view` feature) and `karet-vcs`: diffs and git facts.
