@@ -23,6 +23,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use crate::Event;
+use crate::util::on_path;
 
 /// Which list a location response belongs to.
 #[derive(Clone, Copy, Debug)]
@@ -190,11 +191,6 @@ fn server_keys(lang: &str) -> &'static [&'static str] {
 /// Linters only report problems; their absence is not worth a message.
 pub fn is_linter(key: &str) -> bool {
     key == "ruff"
-}
-
-fn on_path(cmd: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(cmd).is_file()))
 }
 
 /// The first installed server for a key.

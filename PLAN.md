@@ -97,7 +97,10 @@ here.
   `gh`; its commits are fetched for the syntax colours when they are not local yet).
   Each commit range and PR keeps its own comments.
 - Layout: side-by-side, switching to inline when the terminal is narrow; `\` toggles.
-- Keys inside the view are plain letters (nothing is typed into a diff): Up/Down move,
+- Keys inside the view are plain letters (nothing is typed into a diff; held with Ctrl or
+  Alt they do nothing, so Alt+D never deletes a comment). Going to a file, the tree or a
+  search (Alt+N, Alt+E, Alt+K, Alt+1, ...) leaves the view; editing and code features say
+  they do not apply; the same rule table as the Database view. The view's letters: Up/Down move,
   Tab switches between the file list and the diff, Shift+Up/Down select a range,
   `c` comments on the line or range, Enter on a comment edits it, `d` deletes it, `v`
   marks the file viewed, `]`/`[` go to the next/previous file, `y` copies the review,

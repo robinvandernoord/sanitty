@@ -23,6 +23,7 @@ mod statefile;
 mod stylenav;
 mod styles;
 mod tshl;
+mod util;
 
 use std::io::Write;
 use std::path::Path;

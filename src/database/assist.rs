@@ -82,77 +82,56 @@ enum Token {
     Other,
 }
 
-/// The statement's tokens, strings and comments left out.
+/// The statement's tokens, strings and comments left out. Strings,
+/// comments and quoting are found by the same rules as everywhere else
+/// ([`super::sql::skip`]); a quoted name is a word without its quotes.
 fn tokens(engine: Engine, sql: &str) -> Vec<Token> {
-    let chars: Vec<char> = sql.chars().collect();
+    let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut idx = 0;
-    while let Some(&chr) = chars.get(idx) {
-        match chr {
-            '\'' => idx = skip_until(&chars, idx + 1, '\''),
-            '#' if engine == Engine::MySql => idx = skip_until(&chars, idx, '\n'),
-            '"' | '`' => {
-                let end = skip_until(&chars, idx + 1, chr);
-                let name: String = chars
+    while let Some(&byte) = bytes.get(idx) {
+        match byte {
+            b'"' | b'`' => {
+                let end = super::sql::skip(engine, sql, idx).unwrap_or(bytes.len());
+                let inner = sql
                     .get(idx + 1..end.saturating_sub(1).max(idx + 1))
-                    .unwrap_or_default()
-                    .iter()
-                    .collect();
-                out.push(Token::Word(name));
+                    .unwrap_or("");
+                let quote = char::from(byte).to_string();
+                out.push(Token::Word(inner.replace(&quote.repeat(2), &quote)));
                 idx = end;
             }
-            '-' if chars.get(idx + 1) == Some(&'-') => {
-                idx = skip_until(&chars, idx, '\n');
-            }
-            '/' if chars.get(idx + 1) == Some(&'*') => {
-                idx += 2;
-                while idx < chars.len()
-                    && !(chars.get(idx) == Some(&'*') && chars.get(idx + 1) == Some(&'/'))
-                {
-                    idx += 1;
-                }
-                idx += 2;
-            }
-            '.' => {
+            b'.' => {
                 out.push(Token::Dot);
                 idx += 1;
             }
-            ',' => {
+            b',' => {
                 out.push(Token::Comma);
                 idx += 1;
             }
-            _ if is_name_char(chr) => {
-                let start = idx;
-                while chars.get(idx).is_some_and(|chr| is_name_char(*chr)) {
-                    idx += 1;
-                }
-                out.push(Token::Word(
-                    chars.get(start..idx).unwrap_or_default().iter().collect(),
-                ));
-            }
-            _ if chr.is_whitespace() => idx += 1,
             _ => {
-                out.push(Token::Other);
-                idx += 1;
+                if let Some(end) = super::sql::skip(engine, sql, idx) {
+                    idx = end;
+                    continue;
+                }
+                let rest = sql.get(idx..).unwrap_or("");
+                let word_len = rest
+                    .char_indices()
+                    .find(|(_, chr)| !is_name_char(*chr))
+                    .map_or(rest.len(), |(pos, _)| pos);
+                if word_len > 0 {
+                    out.push(Token::Word(rest.get(..word_len).unwrap_or("").to_string()));
+                    idx += word_len;
+                } else {
+                    let step = rest.chars().next().map_or(1, char::len_utf8);
+                    if !rest.starts_with(char::is_whitespace) {
+                        out.push(Token::Other);
+                    }
+                    idx += step;
+                }
             }
         }
     }
     out
-}
-
-/// Past the closing `end` character (a doubled one stays inside).
-fn skip_until(chars: &[char], mut idx: usize, end: char) -> usize {
-    while let Some(&chr) = chars.get(idx) {
-        if chr == end {
-            if end != '\n' && chars.get(idx + 1) == Some(&end) {
-                idx += 2;
-                continue;
-            }
-            return idx + 1;
-        }
-        idx += 1;
-    }
-    chars.len()
 }
 
 fn is_name_char(chr: char) -> bool {

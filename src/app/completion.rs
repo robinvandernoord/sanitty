@@ -20,6 +20,7 @@ use crate::lsp;
 
 use super::App;
 use super::Overlay;
+use crate::util::to_u32;
 
 /// How far PageUp/PageDown move the selection.
 const PAGE: isize = 10;
@@ -379,11 +380,6 @@ fn word_end(doc: &Doc) -> LineCol {
         .take_while(|chr| is_word_char(*chr))
         .count();
     LineCol::new(caret.line, caret.col.saturating_add(to_u32(len)))
-}
-
-/// A char count as `u32`, saturating: no line gets near the limit.
-fn to_u32(count: usize) -> u32 {
-    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 /// The text from `anchor` to the caret.

@@ -22,9 +22,9 @@ use crate::database::grid::Grid;
 use crate::doc::Doc;
 use crate::keymap::Action;
 
-/// What an action does in the Database view.
+/// What an action does in a full-screen view (Database, Review).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum InDb {
+pub(super) enum InView {
     Keep,
     /// A code feature that means nothing here: says so, stays.
     Unavailable,
@@ -58,6 +58,8 @@ impl App {
             return;
         }
         self.screen = Screen::Code;
+        // The find bar (or any popup) belonged to the query editor.
+        self.close_overlay();
         self.save_scratch();
         if let Some((path, home)) = self.db_return.take() {
             match path.and_then(|path| self.docs.iter().position(|doc| doc.path == path)) {
@@ -76,7 +78,7 @@ impl App {
     /// there (in the query editor), going somewhere else leaves the view,
     /// and code features that mean nothing for SQL say so. Every action is
     /// listed, so a new one needs a decision.
-    pub(super) fn in_db_view(action: Action) -> InDb {
+    pub(super) fn in_db_view(action: Action) -> InView {
         match action {
             Action::Database
             | Action::RunSql
@@ -107,7 +109,7 @@ impl App {
             | Action::FindPrev
             | Action::QuickDoc
             | Action::Complete
-            | Action::None => InDb::Keep,
+            | Action::None => InView::Keep,
             Action::GotoDefinition
             | Action::GotoImplementation
             | Action::FindUsages
@@ -115,7 +117,7 @@ impl App {
             | Action::Reformat
             | Action::NextProblem
             | Action::PrevProblem
-            | Action::CloseFile => InDb::Unavailable,
+            | Action::CloseFile => InView::Unavailable,
             Action::Launcher
             | Action::GotoFile
             | Action::GotoSymbol
@@ -127,7 +129,7 @@ impl App {
             | Action::ToggleExplorer
             | Action::Problems
             | Action::NavBack
-            | Action::NavForward => InDb::Leave,
+            | Action::NavForward => InView::Leave,
         }
     }
 
@@ -171,7 +173,7 @@ impl App {
                     true
                 }
                 // Editing keys mean nothing outside the query editor.
-                _ if Self::in_db_view(action) == InDb::Keep => !matches!(
+                _ if Self::in_db_view(action) == InView::Keep => !matches!(
                     action,
                     Action::Database
                         | Action::Quit
@@ -428,7 +430,12 @@ impl App {
             }
             Outcome::Insert(text) => self.insert_in_query(&text),
             Outcome::Opened(path) => self.open_scratch(path),
-            Outcome::Popup(grid) => self.show_result(grid),
+            Outcome::Popup(grid, refresh) => {
+                self.show_result(grid);
+                if let Some(generation) = refresh {
+                    self.db_outcome(Outcome::Refresh(generation));
+                }
+            }
         }
     }
 

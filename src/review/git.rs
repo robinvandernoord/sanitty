@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use super::colour;
 use super::colour::FileColours;
+use crate::util::on_path;
 
 /// Untracked files larger than this are listed without their content.
 const MAX_UNTRACKED_BYTES: u64 = 1024 * 1024;
@@ -276,11 +277,6 @@ pub fn sources(root: &Path) -> Vec<SourceInfo> {
             unavailable: (!has_github).then(|| "needs the GitHub CLI, gh".to_string()),
         },
     ]
-}
-
-fn on_path(cmd: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(cmd).is_file()))
 }
 
 /// Run the GitHub CLI in `root` and return what it printed.

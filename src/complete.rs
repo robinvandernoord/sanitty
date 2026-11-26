@@ -30,6 +30,8 @@ use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 
 use crate::picker::keep_start;
+use crate::util::to_u16;
+use crate::util::to_u32;
 
 /// Numbers every completion list, for [`Completion::list`].
 static LISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -428,16 +430,6 @@ fn docs_area(area: Rect, rect: Rect, below: bool) -> (Rect, bool) {
         }
     };
     (docs, false)
-}
-
-/// A count as `u16`, saturating: screen sizes never get near the limit.
-fn to_u16(count: usize) -> u16 {
-    u16::try_from(count).unwrap_or(u16::MAX)
-}
-
-/// A char count as `u32`, saturating: no text gets near the limit.
-fn to_u32(count: usize) -> u32 {
-    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 /// The indices of `items` that match `prefix`, best first: items starting

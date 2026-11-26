@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use crate::util::to_u32;
 use karet_core::AppliedEdit;
 use karet_core::Change;
 use karet_core::CursorState;
@@ -503,23 +504,8 @@ impl Doc {
             });
             return;
         }
-        if let Some(sel) = self.selection().filter(|range| !range.is_empty()) {
-            let text = self.buffer.slice_range(sel).unwrap_or_default();
-            let edit = editing::insert(sel.end, None, self.buffer.version(), &text);
-            self.apply(edit, EditCause::Replace);
-            return;
-        }
-        let caret = self.caret();
-        let len = self.line_len(caret.line);
-        let line = self.buffer.line(caret.line as usize).unwrap_or_default();
-        let text = format!("\n{}", line.trim_end_matches(['\n', '\r']));
-        let mut edit = editing::insert(
-            LineCol::new(caret.line, len),
-            None,
-            self.buffer.version(),
-            &text,
-        );
-        edit.caret = LineCol::new(caret.line + 1, caret.col);
+        let selection = self.state.cursors().primary();
+        let edit = self.duplicate_edit(selection, self.buffer.version());
         self.apply(edit, EditCause::Replace);
     }
 
@@ -530,42 +516,8 @@ impl Doc {
             });
             return;
         }
-        let caret = self.caret();
-        let last = to_u32(self.buffer.line_count().saturating_sub(1));
-        let range = if caret.line < last {
-            Range {
-                start: LineCol::new(caret.line, 0),
-                end: LineCol::new(caret.line + 1, 0),
-            }
-        } else if caret.line > 0 {
-            Range {
-                start: LineCol::new(caret.line - 1, self.line_len(caret.line - 1)),
-                end: LineCol::new(caret.line, self.line_len(caret.line)),
-            }
-        } else {
-            Range {
-                start: LineCol::new(0, 0),
-                end: LineCol::new(0, self.line_len(0)),
-            }
-        };
-        let mut edit = editing::insert(range.start, Some(range), self.buffer.version(), "");
-        let target_line = range
-            .start
-            .line
-            .min(to_u32(self.buffer.line_count().saturating_sub(2)));
-        edit.caret = LineCol::new(
-            if caret.line < last {
-                caret.line
-            } else {
-                target_line
-            },
-            0,
-        );
+        let edit = self.delete_line_edit(self.caret(), self.buffer.version());
         self.apply(edit, EditCause::Delete);
-        let clamped = self
-            .buffer
-            .clamp(LineCol::new(self.caret().line, caret.col));
-        self.state.place_caret(clamped);
     }
 
     pub fn toggle_comment(&mut self) {
@@ -633,14 +585,16 @@ impl Doc {
             }
         }
         if !edits.is_empty() {
-            self.apply_edits(edits);
-            self.state.place_caret(self.buffer.clamp(LineCol::new(
-                caret.line + u32::from(first == last),
-                caret.col,
-            )));
-            if first == last {
-                self.state.reveal(&self.buffer, self.caret());
-            }
+            // One line: on to the next, as PyCharm does; a selection keeps
+            // the caret. Worked out before the edit, then moved through it,
+            // so the caret lands with the edit (and redo puts it back).
+            let target = if first == last {
+                self.buffer.clamp(LineCol::new(caret.line + 1, caret.col))
+            } else {
+                caret
+            };
+            let after = editing::map_position(target, &edits);
+            self.apply_at_main(edits, after, after);
         }
     }
 
@@ -684,7 +638,18 @@ impl Doc {
                 end: LineCol::new(0, self.line_len(0)),
             }
         };
-        editing::insert(range.start, Some(range), base, "")
+        let mut edit = editing::insert(range.start, Some(range), base, "");
+        // The caret keeps its column on the line that takes this one's place
+        // (the next, or the previous for the last line), worked out before
+        // the edit so redo puts it back there too.
+        let beside = if caret.line < last {
+            caret.line + 1
+        } else {
+            caret.line.saturating_sub(1)
+        };
+        let before = self.buffer.clamp(LineCol::new(beside, caret.col));
+        edit.caret = editing::map_position(before, &edit.change.edits);
+        edit
     }
 
     pub fn undo(&mut self) {
@@ -900,11 +865,6 @@ fn line_visible(state: &EditorState, line: u32) -> bool {
     view.start.line < view.end.line && view.start.line <= line && line < view.end.line
 }
 
-/// A count as a `u32` column or line number, saturating for absurd sizes.
-fn to_u32(count: usize) -> u32 {
-    u32::try_from(count).unwrap_or(u32::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,6 +958,35 @@ mod tests {
         doc.redo();
         assert_eq!(doc.caret(), after);
         assert_eq!(doc.state.cursors().selections.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Delete Line and Toggle Comment with one caret: the caret lands where
+    /// `PyCharm` puts it, and redo puts it back there.
+    #[test]
+    fn line_operations_redo_to_the_same_caret() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("sanitty-lines-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("a.py");
+        std::fs::write(&path, "first line\nsecond\nthird line\n")?;
+        let mut doc = Doc::open(&path)?;
+        doc.goto(LineCol::new(0, 8));
+        doc.delete_line();
+        assert_eq!(doc.buffer.text(), "second\nthird line\n");
+        // Column 8 on "second" (6 long) is its end.
+        assert_eq!(doc.caret(), LineCol::new(0, 6));
+        doc.undo();
+        doc.redo();
+        assert_eq!(doc.caret(), LineCol::new(0, 6));
+
+        doc.goto(LineCol::new(0, 3));
+        doc.toggle_comment();
+        assert_eq!(doc.buffer.text(), "# second\nthird line\n");
+        assert_eq!(doc.caret(), LineCol::new(1, 3));
+        doc.undo();
+        doc.redo();
+        assert_eq!(doc.caret(), LineCol::new(1, 3));
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

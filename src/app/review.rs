@@ -6,6 +6,7 @@ use crossterm::event::KeyEvent;
 use super::App;
 use super::Overlay;
 use super::Screen;
+use super::database::InView;
 use crate::Event;
 use crate::clipboard::Via;
 use crate::keymap::Action;
@@ -33,19 +34,93 @@ impl App {
         }
     }
 
-    /// Keys while the Review view is on screen. True when it used the key.
-    /// Global keys that still work there: the view's own key, the Database
-    /// view's, Quit and All Keys, and anything while a popup (All Keys) is
-    /// open.
+    /// What an action does in the Review view, which is read-only: the
+    /// view's and the app's own keys work, going to a file or a search
+    /// leaves it, and editing or code features say they do not apply. Every
+    /// action is listed, so a new one needs a decision (as in the Database
+    /// view, [`App::in_db_view`]).
+    pub(super) fn in_review_view(action: Action) -> InView {
+        match action {
+            Action::Review
+            | Action::Database
+            | Action::Quit
+            | Action::AllKeys
+            | Action::CheckKeys
+            | Action::Shell
+            | Action::Copy
+            | Action::None => InView::Keep,
+            Action::Launcher
+            | Action::GotoFile
+            | Action::GotoSymbol
+            | Action::GotoLine
+            | Action::SearchInFiles
+            | Action::RecentFiles
+            | Action::PreviousFile
+            | Action::ToggleExplorer
+            | Action::Problems
+            | Action::NavBack
+            | Action::NavForward => InView::Leave,
+            Action::Save
+            | Action::Find
+            | Action::Replace
+            | Action::FindNext
+            | Action::FindPrev
+            | Action::GotoDefinition
+            | Action::GotoImplementation
+            | Action::FindUsages
+            | Action::QuickDoc
+            | Action::Rename
+            | Action::NextProblem
+            | Action::PrevProblem
+            | Action::ToggleComment
+            | Action::Reformat
+            | Action::Complete
+            | Action::RunSql
+            | Action::DuplicateLine
+            | Action::DeleteLine
+            | Action::AddCaretAbove
+            | Action::AddCaretBelow
+            | Action::AddNextOccurrence
+            | Action::RemoveLastCaret
+            | Action::SelectAllOccurrences
+            | Action::CaretsAtLineEnds
+            | Action::Undo
+            | Action::Redo
+            | Action::CopyLine
+            | Action::Cut
+            | Action::Paste
+            | Action::SelectAll
+            | Action::CloseFile => InView::Unavailable,
+        }
+    }
+
+    /// Keys while the Review view is on screen. True when it used the key;
+    /// false lets it run as an action (one that leaves the view does so).
+    /// While the comment box or a list is open, it gets the keys.
     pub(super) fn review_key(&mut self, key: &KeyEvent, action: Option<Action>) -> bool {
         if !self.in_review() || !matches!(self.overlay, Overlay::None) {
             return false;
         }
-        if matches!(
-            action,
-            Some(Action::Review | Action::Database | Action::Quit | Action::AllKeys)
-        ) {
+        let Some(review) = &mut self.review else {
             return false;
+        };
+        let popup = review.has_popup();
+        if let Some(action) = action {
+            match Self::in_review_view(action) {
+                // Ctrl+C is the view's: out of a box, else out of the view.
+                InView::Keep if action == Action::Copy => {}
+                InView::Keep => return false,
+                InView::Leave if !popup => {
+                    self.screen = Screen::Code;
+                    return false;
+                }
+                InView::Unavailable if !popup => {
+                    self.status = format!("{} does not work in the Review view", action.label());
+                    return true;
+                }
+                // The box or list gets it (it ignores Ctrl and Alt chords).
+                InView::Leave | InView::Unavailable => {}
+            }
         }
         let Some(review) = &mut self.review else {
             return false;

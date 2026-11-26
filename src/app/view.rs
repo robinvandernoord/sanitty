@@ -27,6 +27,7 @@ use super::one_line;
 use super::plural;
 use super::problem_texts;
 use super::visible;
+use crate::util::to_u16;
 
 impl App {
     pub fn render(&mut self, frame: &mut Frame) {
@@ -738,11 +739,6 @@ pub(super) fn render_find(frame: &mut Frame, area: Rect, find: &Find, theme: &Th
 /// One hint: the keys to press and what they do.
 fn hint(keys: &str, label: &'static str) -> (String, &'static str) {
     (keys.to_string(), label)
-}
-
-/// A count as a terminal coordinate, saturating instead of wrapping.
-fn to_u16(count: usize) -> u16 {
-    u16::try_from(count).unwrap_or(u16::MAX)
 }
 
 /// Documentation (hover text, a completion item's docs) as lines at most

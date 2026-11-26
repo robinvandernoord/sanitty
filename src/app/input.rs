@@ -27,7 +27,7 @@ use crate::picker::Target;
 use super::App;
 use super::Overlay;
 use super::Request;
-use super::database::InDb;
+use super::database::InView;
 use super::file_name;
 use super::parent_dir;
 use super::save_keycheck;
@@ -220,7 +220,11 @@ impl App {
                 self.request_rename(path, pos, name);
             }
             KeyCode::Backspace => crate::picker::erase(text, key),
-            KeyCode::Char(chr) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(chr)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 text.push(chr);
             }
             _ => {}
@@ -253,8 +257,13 @@ impl App {
             find::Outcome::Handled => {}
             find::Outcome::Close => self.close_overlay(),
             // Not a find key: global actions still work, typing does not.
+            // One that goes to another file or view closes the bar first:
+            // its matches belong to this file.
             find::Outcome::Ignored => {
                 if let Some(action) = action {
+                    if leaves_overlay(action) {
+                        self.close_overlay();
+                    }
                     self.run(action);
                 }
             }
@@ -298,11 +307,6 @@ impl App {
             }
             _ => {}
         }
-        if let Some(doc) = self.doc()
-            && doc.state.selection_range().is_some_and(Range::is_empty)
-        {
-            doc.state.clear_selection();
-        }
     }
 
     pub(super) fn run(&mut self, action: Action) {
@@ -310,9 +314,9 @@ impl App {
         // leaves it, and code-only features say they do not apply.
         if self.in_db() {
             match Self::in_db_view(action) {
-                InDb::Keep => {}
-                InDb::Leave => self.leave_database(),
-                InDb::Unavailable => {
+                InView::Keep => {}
+                InView::Leave => self.leave_database(),
+                InView::Unavailable => {
                     self.status = format!("{} does not work in the Database view", action.label());
                     return;
                 }

@@ -4,24 +4,17 @@
 
 use std::path::Path;
 
+use crate::util::to_u32;
 use karet_core::LineCol;
 
 /// Files whose colour values get swatches.
 pub fn wants_swatches(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("css" | "scss" | "sass" | "less" | "html" | "htm" | "vue" | "svelte")
-    )
+    crate::util::is_style_file(path)
 }
 
 /// Whether `chr` continues a name, so a colour cannot start or end next to it.
 fn is_name_char(chr: char) -> bool {
     chr.is_alphanumeric() || chr == '-' || chr == '_'
-}
-
-/// A char count or index as `u32`, saturating (lines never get that long).
-fn to_u32(count: usize) -> u32 {
-    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 /// A colour channel from a float, clamped to `0..=255` and rounded.

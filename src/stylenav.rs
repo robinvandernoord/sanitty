@@ -16,14 +16,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::Event;
 use crate::lsp::Nav;
-
-/// Files that can define or use style variables.
-fn is_style_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("css" | "scss" | "sass" | "less" | "html" | "htm" | "vue" | "svelte")
-    )
-}
+use crate::util::is_style_file;
+use crate::util::to_u32;
 
 /// The style variable under `col` (chars) in `line`: `--name`, `$name` or `@name`.
 pub fn variable_at(path: &Path, line: &str, col: usize) -> Option<String> {
@@ -64,11 +58,6 @@ pub fn variable_at(path: &Path, line: &str, col: usize) -> Option<String> {
 /// Whether `chr` can be part of a variable name.
 fn is_name_part(chr: char) -> bool {
     chr.is_alphanumeric() || chr == '-' || chr == '_'
-}
-
-/// A count or index as `u32`, saturating for absurdly long lines.
-fn to_u32(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Search the project (open buffers win over the files on disk) and answer

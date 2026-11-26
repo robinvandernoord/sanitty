@@ -12,29 +12,19 @@ pub mod confirm;
 pub mod conn;
 pub mod driver;
 pub mod grid;
+mod render;
 pub mod sql;
+mod tree;
+
+use tree::schema_names;
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
-use karet_core::ThemeRole;
-use karet_theme::Theme;
-use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::Modifier;
-use ratatui::style::Style;
-use ratatui::text::Line;
-use ratatui::text::Span;
-use ratatui::widgets::Block;
-use ratatui::widgets::BorderType;
-use ratatui::widgets::Clear;
-use ratatui::widgets::Paragraph;
-use ratatui::widgets::Wrap;
 
 use conn::Connection;
 use driver::Origin;
@@ -66,8 +56,9 @@ pub enum Outcome {
     Insert(String),
     /// The query editor for this connection is ready: open its file.
     Opened(PathBuf),
-    /// Show this result over the code (it was run from a `.sql` file).
-    Popup(Grid),
+    /// Show this result over the code (it was run from a `.sql` file), and
+    /// read the schema again with this generation when it changed it.
+    Popup(Grid, Option<u64>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +153,9 @@ pub struct Database {
     schema: Option<Schema>,
     /// Bumped for every connect and run; an older answer is dropped.
     generation: u64,
+    /// Bumped for every schema read, apart from runs: a query started while
+    /// the schema is being read again does not cancel that.
+    schema_generation: u64,
     pending: Option<Pending>,
     tree: Tree,
     pub focus: Focus,
@@ -181,6 +175,7 @@ impl Database {
             pool: None,
             schema: None,
             generation: 0,
+            schema_generation: 0,
             pending: None,
             tree: Tree::default(),
             focus: Focus::Tree,
@@ -245,6 +240,7 @@ impl Database {
             return Outcome::Pending;
         };
         self.generation += 1;
+        self.schema_generation += 1;
         self.current = Some(idx);
         self.pool = None;
         self.schema = None;
@@ -284,7 +280,7 @@ impl Database {
     }
 
     pub fn schema_loaded(&mut self, generation: u64, result: Result<Schema, String>) -> Outcome {
-        if generation != self.generation {
+        if generation != self.schema_generation {
             return Outcome::Pending;
         }
         match result {
@@ -385,6 +381,12 @@ impl Database {
         Some((self.schema.as_ref()?, self.engine()?))
     }
 
+    /// A new schema read: the generation its answer must carry.
+    fn refresh(&mut self) -> u64 {
+        self.schema_generation += 1;
+        self.schema_generation
+    }
+
     pub fn has_popup(&self) -> bool {
         self.popup.is_some()
     }
@@ -429,7 +431,8 @@ impl Database {
                     .any(|part| part == *word)
             });
         if pending.to_popup {
-            return Outcome::Popup(Grid::new(result, pending.sql));
+            let refresh = changes_schema.then(|| self.refresh());
+            return Outcome::Popup(Grid::new(result, pending.sql), refresh);
         }
         if pending.rerun {
             // A cell was written: show the rows again, in place, when the
@@ -462,7 +465,7 @@ impl Database {
         }
         self.grid = Some(grid);
         if changes_schema {
-            Outcome::Refresh(self.generation)
+            Outcome::Refresh(self.refresh())
         } else {
             Outcome::Pending
         }
@@ -761,105 +764,6 @@ impl Database {
         Outcome::Pending
     }
 
-    fn tree_key(&mut self, key: &KeyEvent) -> Outcome {
-        if self.tree.filtering {
-            let filter = self.tree.filter.get_or_insert_with(String::new);
-            match key.code {
-                KeyCode::Esc => {
-                    self.tree.filter = None;
-                    self.tree.filtering = false;
-                }
-                KeyCode::Enter | KeyCode::Down | KeyCode::Up => {
-                    self.tree.filtering = false;
-                    if key.code != KeyCode::Enter {
-                        return self.tree_key(key);
-                    }
-                }
-                KeyCode::Backspace => crate::picker::erase(filter, key),
-                KeyCode::Char(chr) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    filter.push(chr);
-                }
-                _ => {}
-            }
-            self.tree.selected = 0;
-            self.tree.top = 0;
-            return Outcome::Pending;
-        }
-        let nodes = self.nodes();
-        let last = nodes.len().saturating_sub(1);
-        let node = nodes.get(self.tree.selected).cloned();
-        match key.code {
-            KeyCode::Up => self.tree.selected = self.tree.selected.saturating_sub(1),
-            KeyCode::Down => self.tree.selected = (self.tree.selected + 1).min(last),
-            KeyCode::PageUp => {
-                self.tree.selected = self.tree.selected.saturating_sub(self.tree.page);
-            }
-            KeyCode::PageDown => {
-                self.tree.selected = (self.tree.selected + self.tree.page).min(last);
-            }
-            KeyCode::Home => self.tree.selected = 0,
-            KeyCode::End => self.tree.selected = last,
-            KeyCode::Right => {
-                if let Some(name) = node.as_ref().and_then(|node| self.node_key(node)) {
-                    self.tree.open.insert(name);
-                }
-            }
-            KeyCode::Left => self.collapse(node.as_ref(), &nodes),
-            KeyCode::Enter => match &node {
-                Some(Node::Table(idx)) => return self.open_table(*idx),
-                Some(node @ Node::Schema(_)) => {
-                    if let Some(name) = self.node_key(node)
-                        && !self.tree.open.remove(&name)
-                    {
-                        self.tree.open.insert(name);
-                    }
-                }
-                _ => {}
-            },
-            KeyCode::Char('s') => {
-                if let Some(table) = node.as_ref().and_then(|node| self.node_table(node)) {
-                    return Outcome::Insert(format!("select * from {table};"));
-                }
-            }
-            KeyCode::Char('/') => {
-                self.tree.filter = Some(String::new());
-                self.tree.filtering = true;
-            }
-            KeyCode::Esc if self.tree.filter.is_some() => self.tree.filter = None,
-            KeyCode::Char('c') => self.open_connections(),
-            KeyCode::Char('r') => return Outcome::Refresh(self.generation),
-            KeyCode::Char('y') => {
-                if let Some(name) = node.as_ref().and_then(|node| self.node_name(node)) {
-                    return Outcome::Copy(name.clone(), format!("Copied {name}"));
-                }
-            }
-            _ => {}
-        }
-        Outcome::Pending
-    }
-
-    fn collapse(&mut self, node: Option<&Node>, nodes: &[Node]) {
-        let Some(node) = node else { return };
-        if let Some(name) = self.node_key(node)
-            && self.tree.open.remove(&name)
-        {
-            return;
-        }
-        // Already closed (or a column): go to the parent.
-        let parent = match node {
-            Node::Column(table, _) => Some(Node::Table(*table)),
-            Node::Table(idx) => self
-                .table(*idx)
-                .map(|table| Node::Schema(table.schema.clone())),
-            Node::Schema(_) => None,
-        };
-        if let Some(parent) = parent
-            && let Some(pos) = nodes.iter().position(|other| *other == parent)
-        {
-            self.tree.selected = pos;
-        }
-    }
-
     fn grid_key(&mut self, key: &KeyEvent) -> Outcome {
         let Some(grid) = &mut self.grid else {
             return Outcome::Pending;
@@ -893,489 +797,6 @@ impl Database {
             }
             _ => Outcome::Pending,
         }
-    }
-
-    fn open_table(&mut self, idx: usize) -> Outcome {
-        let (Some(table), Some(engine)) = (self.table(idx), self.engine()) else {
-            return Outcome::Pending;
-        };
-        let name = sql::table_name(engine, &table.schema, &table.name);
-        let key: Vec<String> = table
-            .primary_key()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let order = if key.is_empty() {
-            String::new()
-        } else {
-            let names: Vec<String> = key
-                .iter()
-                .map(|column| sql::ident(engine, column))
-                .collect();
-            format!(" ORDER BY {}", names.join(", "))
-        };
-        self.focus = Focus::Grid;
-        self.execute(Pending {
-            sql: format!(
-                "SELECT * FROM {name}{order} LIMIT {}",
-                crate::settings::get().database.table_rows
-            ),
-            rerun: false,
-            to_popup: false,
-        })
-    }
-
-    fn table(&self, idx: usize) -> Option<&driver::Table> {
-        self.schema.as_ref()?.tables.get(idx)
-    }
-
-    fn node_key(&self, node: &Node) -> Option<String> {
-        match node {
-            Node::Schema(name) => Some(name.clone()),
-            Node::Table(idx) => self
-                .table(*idx)
-                .map(|table| format!("{}.{}", table.schema, table.name)),
-            Node::Column(..) => None,
-        }
-    }
-
-    /// The quoted table a node belongs to.
-    fn node_table(&self, node: &Node) -> Option<String> {
-        let idx = match node {
-            Node::Table(idx) | Node::Column(idx, _) => *idx,
-            Node::Schema(_) => return None,
-        };
-        let table = self.table(idx)?;
-        Some(sql::table_name(self.engine()?, &table.schema, &table.name))
-    }
-
-    fn node_name(&self, node: &Node) -> Option<String> {
-        match node {
-            Node::Schema(name) => Some(name.clone()),
-            Node::Table(idx) => self.table(*idx).map(|table| table.name.clone()),
-            Node::Column(table, column) => self
-                .table(*table)
-                .and_then(|table| table.columns.get(*column))
-                .map(|column| column.name.clone()),
-        }
-    }
-
-    /// The tree's rows: schemas (left out when there is only one), their
-    /// tables when open, a table's columns when open. A filter shows the
-    /// matching tables of every schema.
-    fn nodes(&self) -> Vec<Node> {
-        let Some(schema) = &self.schema else {
-            return Vec::new();
-        };
-        let names = schema_names(schema);
-        let flat = names.len() <= 1;
-        let filter = self
-            .tree
-            .filter
-            .as_deref()
-            .filter(|text| !text.is_empty())
-            .map(str::to_lowercase);
-        let mut out = Vec::new();
-        for name in &names {
-            if !flat {
-                out.push(Node::Schema(name.clone()));
-            }
-            if !flat && filter.is_none() && !self.tree.open.contains(name) {
-                continue;
-            }
-            for (idx, table) in schema.tables.iter().enumerate() {
-                if table.schema != *name
-                    || filter
-                        .as_ref()
-                        .is_some_and(|text| !table.name.to_lowercase().contains(text))
-                {
-                    continue;
-                }
-                out.push(Node::Table(idx));
-                if self
-                    .tree
-                    .open
-                    .contains(&format!("{}.{}", table.schema, table.name))
-                {
-                    out.extend((0..table.columns.len()).map(|col| Node::Column(idx, col)));
-                }
-            }
-        }
-        if filter.is_some() && !flat {
-            // Schemas without a match are left out.
-            let keep: Vec<Node> = out
-                .iter()
-                .enumerate()
-                .filter(|(pos, node)| match node {
-                    Node::Schema(_) => matches!(out.get(pos + 1), Some(Node::Table(_))),
-                    _ => true,
-                })
-                .map(|(_, node)| node.clone())
-                .collect();
-            return keep;
-        }
-        out
-    }
-
-    pub fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        match &self.popup {
-            Some(Popup::Connections { .. }) => {
-                return vec![("Enter", "Connect"), ("Up/Down", "Move"), ("Esc", "Close")];
-            }
-            Some(Popup::Confirm { confirm, .. }) => return confirm.hints(),
-            Some(Popup::Edit { .. }) => {
-                return vec![("Enter", "Write"), ("Tab", "NULL"), ("Esc", "Cancel")];
-            }
-            None => {}
-        }
-        if !matches!(self.phase, Phase::Ready) {
-            return vec![("c", "Connections"), ("r", "Find again")];
-        }
-        match self.focus {
-            Focus::Tree if self.tree.filtering => {
-                vec![("Type", "Filter"), ("Enter", "Done"), ("Esc", "Clear")]
-            }
-            Focus::Tree => vec![
-                ("Enter", "Open table"),
-                ("Right/Left", "Expand"),
-                ("s", "Select in query"),
-                ("/", "Filter"),
-                ("c", "Connections"),
-                ("r", "Refresh"),
-                ("Tab", "Next pane"),
-            ],
-            Focus::Query => vec![("Shift+Tab", "Next pane")],
-            Focus::Grid => vec![
-                ("Enter", "Edit cell"),
-                ("y", "Copy value"),
-                ("r", "Run again"),
-                ("Tab", "Next pane"),
-            ],
-        }
-    }
-
-    /// Draw the view. Gives back where the query editor goes, when it is
-    /// shown, for the app to draw the file there; the app then draws
-    /// [`Database::render_popup`] over both.
-    pub fn render(
-        &mut self,
-        frame: &mut Frame,
-        top: Rect,
-        body: Rect,
-        theme: &Theme,
-    ) -> Option<Rect> {
-        let base = crate::styles::surface(theme);
-        let muted = theme.style(ThemeRole::Muted);
-        self.render_title(frame, top, theme);
-        let message = match &self.phase {
-            Phase::Finding => Some("Looking for databases...".to_string()),
-            Phase::Connecting => Some("Connecting...".to_string()),
-            Phase::Idle(text) => Some(text.clone()),
-            Phase::Ready => None,
-        };
-        if let Some(text) = message {
-            frame.render_widget(
-                Paragraph::new(Line::styled(format!("  {text}"), muted))
-                    .style(base)
-                    .wrap(Wrap { trim: false }),
-                body,
-            );
-            return None;
-        }
-        let tree_width = (body.width / 4).clamp(24, 44).min(body.width / 2);
-        let tree_area = Rect {
-            width: tree_width,
-            ..body
-        };
-        let right = Rect {
-            x: body.x.saturating_add(tree_width),
-            width: body.width.saturating_sub(tree_width),
-            ..body
-        };
-        let query_height = (right.height * 2 / 5).max(5).min(right.height);
-        let query_area = Rect {
-            height: query_height,
-            ..right
-        };
-        let grid_area = Rect {
-            y: right.y.saturating_add(query_height),
-            height: right.height.saturating_sub(query_height),
-            ..right
-        };
-        self.render_tree(frame, tree_area, theme);
-        let name = self
-            .current
-            .and_then(|idx| self.connections.get(idx))
-            .map_or_else(String::new, |conn| conn.name.clone());
-        let query_block = self
-            .pane(Focus::Query, format!(" {name}.sql "), theme)
-            .title(Line::styled(" Alt+Enter run ", muted).right_aligned());
-        let query_inner = query_block.inner(query_area);
-        frame.render_widget(query_block, query_area);
-        self.render_grid(frame, grid_area, theme);
-        Some(query_inner)
-    }
-
-    fn pane(&self, focus: Focus, title: String, theme: &Theme) -> Block<'static> {
-        let base = crate::styles::surface(theme);
-        let border = if self.focus == focus {
-            base
-        } else {
-            theme.style(ThemeRole::Muted)
-        };
-        Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(border)
-            .title(title)
-            .style(base)
-    }
-
-    fn render_title(&self, frame: &mut Frame, top: Rect, theme: &Theme) {
-        let mut text = String::from(" Database");
-        if let Some(conn) = self.current.and_then(|idx| self.connections.get(idx)) {
-            let _ = write!(text, "   {} ({})", conn.name, conn.describe());
-        }
-        if let Some(schema) = &self.schema {
-            let count = schema.tables.len();
-            let _ = write!(
-                text,
-                "   {count} {}",
-                if count == 1 { "table" } else { "tables" }
-            );
-        }
-        if self.running() {
-            text.push_str("   (running...)");
-        }
-        frame.render_widget(Paragraph::new(text).style(crate::styles::bar(theme)), top);
-    }
-
-    fn render_tree(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let muted = theme.style(ThemeRole::Muted);
-        let title = match &self.tree.filter {
-            Some(filter) => format!(" /{filter} "),
-            None => " schema ".to_string(),
-        };
-        let block = self.pane(Focus::Tree, title, theme);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let nodes = self.nodes();
-        let height = usize::from(inner.height);
-        self.tree.page = height.saturating_sub(1).max(1);
-        if self.tree.selected < self.tree.top {
-            self.tree.top = self.tree.selected;
-        } else if height > 0 && self.tree.selected >= self.tree.top + height {
-            self.tree.top = self.tree.selected + 1 - height;
-        }
-        let flat = self
-            .schema
-            .as_ref()
-            .is_none_or(|schema| schema_names(schema).len() <= 1);
-        let width = usize::from(inner.width);
-        let type_style = theme.token_style(karet_core::StandardToken::Type.id());
-        let lines: Vec<Line> = nodes
-            .iter()
-            .enumerate()
-            .skip(self.tree.top)
-            .take(height)
-            .map(|(pos, node)| {
-                let indent = |level: usize| "  ".repeat(if flat { level - 1 } else { level });
-                let arrow = |open: bool| if open { "v " } else { "> " };
-                let mut spans = match node {
-                    Node::Schema(name) => vec![Span::raw(format!(
-                        "{}{name}",
-                        arrow(self.tree.open.contains(name))
-                    ))],
-                    Node::Table(idx) => {
-                        let table = self.table(*idx);
-                        let open = table.is_some_and(|table| {
-                            self.tree
-                                .open
-                                .contains(&format!("{}.{}", table.schema, table.name))
-                        });
-                        let name = table.map_or("", |table| table.name.as_str());
-                        let mut spans =
-                            vec![Span::raw(format!("{}{}{name}", indent(1), arrow(open)))];
-                        if table.is_some_and(|table| table.view) {
-                            spans.push(Span::styled(" view", muted));
-                        }
-                        spans
-                    }
-                    Node::Column(table, column) => {
-                        let column = self
-                            .table(*table)
-                            .and_then(|table| table.columns.get(*column));
-                        let (name, sql_type, key) = column.map_or(("", "", false), |column| {
-                            (
-                                column.name.as_str(),
-                                column.sql_type.as_str(),
-                                column.primary,
-                            )
-                        });
-                        let mark = if key { "* " } else { "  " };
-                        vec![
-                            Span::raw(format!("{}{mark}{name} ", indent(2))),
-                            Span::styled(sql_type.to_string(), type_style),
-                        ]
-                    }
-                };
-                let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-                spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-                let line = Line::from(spans);
-                if pos == self.tree.selected {
-                    selected(line, theme, self.focus == Focus::Tree)
-                } else {
-                    line
-                }
-            })
-            .collect();
-        if lines.is_empty() {
-            let text = if self.tree.filter.is_some() {
-                "  No table matches"
-            } else {
-                "  No tables"
-            };
-            frame.render_widget(Paragraph::new(Line::styled(text, muted)), inner);
-        } else {
-            frame.render_widget(Paragraph::new(lines), inner);
-        }
-    }
-
-    fn render_grid(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let error_style = theme.style(ThemeRole::DiagnosticError);
-        let title = match (&self.error, &self.grid) {
-            (Some(_), _) => " error ".to_string(),
-            (None, Some(grid)) => format!(" {} ", grid.summary()),
-            (None, None) => " result ".to_string(),
-        };
-        let mut block = self.pane(Focus::Grid, title, theme);
-        if let Some(grid) = &self.grid
-            && grid.result.origins.iter().any(Option::is_some)
-            && self.error.is_none()
-        {
-            block = block.title(
-                Line::styled(" Enter edits a cell ", theme.style(ThemeRole::Muted)).right_aligned(),
-            );
-        }
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        if let Some(err) = &self.error {
-            frame.render_widget(
-                Paragraph::new(Line::styled(err.clone(), error_style)).wrap(Wrap { trim: false }),
-                inner,
-            );
-            return;
-        }
-        let focused = self.focus == Focus::Grid;
-        if let Some(grid) = &mut self.grid {
-            grid.render(frame, inner, theme, focused);
-        }
-    }
-
-    pub fn render_popup(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let Some(popup) = &mut self.popup else { return };
-        match popup {
-            Popup::Connections { selected } => {
-                let lines: Vec<Line> = self
-                    .connections
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, conn)| {
-                        let line = Line::from(vec![
-                            Span::raw(format!(" {} ", conn.name)),
-                            Span::styled(
-                                format!("{} ", conn.describe()),
-                                theme.style(ThemeRole::Muted),
-                            ),
-                        ]);
-                        if idx == *selected {
-                            line.style(Style::default().add_modifier(Modifier::REVERSED))
-                        } else {
-                            line
-                        }
-                    })
-                    .collect();
-                popup_box(frame, area, " Connections ", lines, theme);
-            }
-            Popup::Confirm { confirm, .. } => confirm.render(frame, area, theme),
-            Popup::Edit { text, null } => {
-                let column = self
-                    .grid
-                    .as_ref()
-                    .and_then(Grid::column_name)
-                    .unwrap_or("value");
-                let value = if *null {
-                    Line::styled("NULL", theme.style(ThemeRole::Muted))
-                } else {
-                    Line::raw(format!("{text}\u{2588}"))
-                };
-                popup_box(frame, area, &format!(" {column} "), vec![value], theme);
-            }
-        }
-    }
-}
-
-/// A centred box with a border and these lines.
-pub fn popup_box(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line>, theme: &Theme) {
-    let base = crate::styles::surface(theme);
-    let wanted = lines
-        .iter()
-        .map(Line::width)
-        .max()
-        .unwrap_or(40)
-        .max(title.chars().count() + 4)
-        .saturating_add(4);
-    let width = u16::try_from(wanted.max(50))
-        .unwrap_or(u16::MAX)
-        .min(area.width.saturating_sub(4));
-    let height = u16::try_from(lines.len().saturating_add(2))
-        .unwrap_or(u16::MAX)
-        .min(area.height.saturating_sub(2));
-    let rect = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 3,
-        width,
-        height,
-    };
-    frame.render_widget(Clear, rect);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(title.to_string())
-        .style(base);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        rect,
-    );
-}
-
-/// The schema names in order.
-fn schema_names(schema: &Schema) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for table in &schema.tables {
-        if names.last() != Some(&table.schema) && !names.contains(&table.schema) {
-            names.push(table.schema.clone());
-        }
-    }
-    names
-}
-
-fn selected<'a>(line: Line<'a>, theme: &Theme, focused: bool) -> Line<'a> {
-    let colour = theme.style(ThemeRole::Selection).fg;
-    match colour {
-        Some(colour) if focused => {
-            let spans: Vec<Span> = line
-                .spans
-                .into_iter()
-                .map(|span| {
-                    let style = span.style.bg(colour);
-                    span.style(style)
-                })
-                .collect();
-            Line::from(spans)
-        }
-        None if focused => line.style(Style::default().add_modifier(Modifier::REVERSED)),
-        _ => line.style(Style::default().add_modifier(Modifier::BOLD)),
     }
 }
 

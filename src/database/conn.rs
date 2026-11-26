@@ -129,7 +129,13 @@ pub fn discover(root: &Path) -> (Vec<Connection>, Vec<String>) {
     let mut problems = Vec::new();
     let mut found = if COMPOSE_FILES.iter().any(|name| root.join(name).is_file()) {
         match compose_config(root) {
-            Ok(json) => from_compose(&json, &|service| container_ip(root, service)),
+            Ok(json) => match from_compose(&json, &|service| container_ip(root, service)) {
+                Ok(found) => found,
+                Err(err) => {
+                    problems.push(format!("docker compose config: unexpected output ({err})"));
+                    Vec::new()
+                }
+            },
             Err(err) => {
                 problems.push(format!("docker compose config: {err}"));
                 Vec::new()
@@ -179,7 +185,7 @@ fn container_ip(root: &Path, service: &str) -> Option<String> {
             .filter(|out| out.status.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
     };
-    let ids = run(&["compose", "ps", "-q", service])?;
+    let ids = run(&["compose", "ps", "-q", "--", service])?;
     let id = ids.lines().next()?.trim().to_string();
     if id.is_empty() {
         return None;
@@ -238,15 +244,16 @@ const MYSQL_KEYS: &[&str] = &[
 /// image (postgres, postgis, timescaledb, pgvector, mysql, mariadb, percona)
 /// or, for images built locally, by the server's own environment variables;
 /// clients that only have a `POSTGRES_URI` do not.
-fn from_compose(json: &str, ip_of: &dyn Fn(&str) -> Option<String>) -> Vec<Connection> {
-    let Ok(config) = serde_json::from_str::<ComposeConfig>(json) else {
-        return Vec::new();
-    };
-    config
+fn from_compose(
+    json: &str,
+    ip_of: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<Connection>, String> {
+    let config = serde_json::from_str::<ComposeConfig>(json).map_err(|err| err.to_string())?;
+    Ok(config
         .services
         .into_iter()
         .filter_map(|(name, service)| server(&name, &service, ip_of))
-        .collect()
+        .collect())
 }
 
 fn server(
@@ -501,7 +508,7 @@ mod tests {
 
     #[test]
     fn finds_servers_by_image_or_environment() -> Result<(), String> {
-        let found = from_compose(COMPOSE, &addr);
+        let found = from_compose(COMPOSE, &addr)?;
         let names: Vec<&str> = found.iter().map(|conn| conn.name.as_str()).collect();
         assert_eq!(names, ["maria", "pg-0"]);
         let postgres = named(&found, "pg-0")?;
@@ -532,7 +539,7 @@ mod tests {
 
     #[test]
     fn db_toml_overrides_services_and_adds_its_own() -> Result<(), String> {
-        let mut found = from_compose(COMPOSE, &|_| None);
+        let mut found = from_compose(COMPOSE, &|_| None)?;
         assert!(named(&found, "maria")?.unreachable.is_some());
         let config: DbToml = toml::from_str(
             r#"

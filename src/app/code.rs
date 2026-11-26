@@ -98,6 +98,33 @@ impl App {
         }
     }
 
+    /// Open CSV/TSV files' problems (sanitty checks those itself) into the
+    /// list the language servers fill, so F8 steps through them across
+    /// files and Problems (Alt+6) lists them. The list holds UTF-16
+    /// columns, as servers report them.
+    pub(super) fn sync_table_problems(&mut self) {
+        for doc in self.docs.iter().filter(|doc| doc.table.is_some()) {
+            let to_utf16 = |pos: LineCol| LineCol::new(pos.line, doc.buffer.line_col_to_utf16(pos));
+            let found: Vec<karet_core::Diagnostic> = doc
+                .diagnostics
+                .iter()
+                .map(|diag| {
+                    let mut diag = diag.clone();
+                    diag.range = karet_core::Range {
+                        start: to_utf16(diag.range.start),
+                        end: to_utf16(diag.range.end),
+                    };
+                    diag
+                })
+                .collect();
+            if found.is_empty() {
+                self.problems.remove(&doc.path);
+            } else if self.problems.get(&doc.path) != Some(&found) {
+                self.problems.insert(doc.path.clone(), found);
+            }
+        }
+    }
+
     /// Launcher items for every reported problem, errors first.
     pub(super) fn problem_items(&self) -> Vec<Item> {
         let mut all: Vec<(&PathBuf, &karet_core::Diagnostic)> = self
@@ -344,7 +371,7 @@ impl App {
             return;
         }
         let indentation = karet_lsp::Indentation {
-            tab_size: 4,
+            tab_size: u32::try_from(crate::settings::get().editor.tab_size).unwrap_or(4),
             insert_spaces: !doc.buffer.text().lines().any(|line| line.starts_with('\t')),
         };
         lsp::format(
@@ -472,6 +499,8 @@ impl App {
                     .collect();
                 if doc.apply_edits(edits) {
                     files += 1;
+                } else {
+                    failed += 1;
                 }
             }
         }
@@ -483,7 +512,7 @@ impl App {
         let mut notes = Vec::new();
         if failed > 0 {
             notes.push(format!(
-                " ({failed} file(s) could not be opened, not renamed there)"
+                " ({failed} file(s) could not be opened or changed, not renamed there)"
             ));
         }
         if skipped > 0 {

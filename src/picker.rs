@@ -29,6 +29,7 @@ use ratatui::widgets::ListState;
 use ratatui::widgets::Paragraph;
 
 use crate::keymap::Action;
+use crate::util::to_u32;
 
 /// What picking an item does.
 #[derive(Clone, Debug)]
@@ -425,7 +426,7 @@ impl Picker {
                 self.changed = true;
                 self.refilter();
             }
-            KeyCode::Char(chr) if !ctrl => {
+            KeyCode::Char(chr) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
                 self.query.push(chr);
                 self.changed = true;
                 self.refilter();
@@ -639,11 +640,6 @@ struct Styles {
     surface: Style,
     muted: Style,
     accent: Style,
-}
-
-/// A count or position as `u32`, saturating (match positions are `u32`).
-fn to_u32(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Launcher ranking in tiers, so a whole-word hit beats letters scattered

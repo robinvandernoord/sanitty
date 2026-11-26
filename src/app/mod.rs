@@ -25,6 +25,7 @@ use crate::keymap::Keymap;
 use crate::lsp;
 use crate::picker::Kind;
 use crate::picker::Picker;
+use crate::util::plural_word as plural;
 
 mod code;
 mod completion;
@@ -293,6 +294,7 @@ impl App {
             }
             Event::Tick => {
                 self.sync_lsp();
+                self.sync_table_problems();
                 self.auto_hover();
             }
             Event::Semantic(path, version, tokens) => {
@@ -441,14 +443,6 @@ impl App {
 /// used alongside other parts of `App` (the find bar, the status line).
 fn visible(docs: &mut [Doc], active: usize, home: bool) -> Option<&mut Doc> {
     if home { None } else { docs.get_mut(active) }
-}
-
-fn plural(count: usize, word: &str) -> String {
-    if count == 1 {
-        word.to_string()
-    } else {
-        format!("{word}s")
-    }
 }
 
 fn file_name(path: &Path) -> String {

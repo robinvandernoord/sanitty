@@ -79,7 +79,7 @@ impl AllKeys {
                 crate::picker::erase(&mut self.query, key);
                 self.selected = 0;
             }
-            KeyCode::Char(chr) if !ctrl => {
+            KeyCode::Char(chr) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
                 self.query.push(chr);
                 self.selected = 0;
             }

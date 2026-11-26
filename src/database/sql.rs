@@ -35,7 +35,7 @@ pub fn split(engine: Engine, text: &str) -> Vec<Range<usize>> {
 
 /// Past a string, quoted name, comment or dollar-quoted body starting at
 /// `idx`; `None` when nothing like that starts there.
-fn skip(engine: Engine, text: &str, idx: usize) -> Option<usize> {
+pub(super) fn skip(engine: Engine, text: &str, idx: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let next = bytes.get(idx + 1);
     Some(match *bytes.get(idx)? {
