@@ -15,6 +15,7 @@ use crate::Event;
 use crate::database::Database;
 use crate::database::Focus;
 use crate::database::Outcome;
+use crate::database::confirm::Answer;
 use crate::database::conn;
 use crate::database::driver;
 use crate::database::grid::Grid;
@@ -293,8 +294,8 @@ impl App {
             return;
         };
         let outcome = view.ask(sql, !in_view);
-        if !in_view && let Some(sql) = view.take_confirm() {
-            self.overlay = Overlay::DbConfirm(sql);
+        if !in_view && let Some(confirm) = view.take_confirm() {
+            self.overlay = Overlay::DbConfirm(confirm);
         }
         self.db_outcome(outcome);
     }
@@ -326,22 +327,28 @@ impl App {
                 }
                 true
             }
-            Overlay::DbConfirm(sql) => {
-                match key.code {
-                    KeyCode::Enter | KeyCode::Char('y') => {
-                        let sql = sql.clone();
+            Overlay::DbConfirm(confirm) => {
+                match confirm.handle_key(key) {
+                    Answer::Run => {
+                        let sql = confirm.sql.clone();
                         self.overlay = Overlay::None;
                         if let Some(view) = &mut self.database {
                             let outcome = view.confirmed(sql);
                             self.db_outcome(outcome);
                         }
                     }
-                    KeyCode::Esc | KeyCode::Char('n') => {
+                    Answer::Cancel => {
                         self.overlay = Overlay::None;
                         self.status = "Not run".into();
                     }
-                    _ if action == Some(Action::Copy) => self.overlay = Overlay::None,
-                    _ => {}
+                    Answer::NotSeen => {
+                        self.status = "Scroll down to see all of the SQL first".into();
+                    }
+                    Answer::Pending if action == Some(Action::Copy) => {
+                        self.overlay = Overlay::None;
+                        self.status = "Not run".into();
+                    }
+                    Answer::Pending => {}
                 }
                 true
             }
@@ -397,6 +404,15 @@ impl App {
                 };
                 tokio::spawn(async move {
                     let _ = tx.send(Event::DbSchema(generation, driver::schema(&handle).await));
+                });
+            }
+            Outcome::ExecuteOneRow(sql, generation) => {
+                let Some(handle) = self.database.as_ref().and_then(Database::handle) else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let result = driver::update_one_row(&handle, &sql).await;
+                    let _ = tx.send(Event::DbResult(generation, result));
                 });
             }
             Outcome::Execute(sql, generation) => {

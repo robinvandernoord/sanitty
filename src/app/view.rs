@@ -61,7 +61,7 @@ impl App {
                 self.render_editor(frame, query);
             }
             // The view's own popups go over the query editor too.
-            if let Some(view) = &self.database {
+            if let Some(view) = &mut self.database {
                 view.render_popup(frame, body, &self.theme);
             }
         } else {
@@ -165,17 +165,7 @@ impl App {
             Overlay::AllKeys(all_keys) => all_keys.render(frame, body, theme),
             Overlay::KeyCheck(key_check) => key_check.render(frame, body, theme),
             Overlay::DbResult(grid) => render_db_result(frame, body, grid, theme),
-            Overlay::DbConfirm(sql) => {
-                let mut lines = vec![
-                    Line::styled(
-                        "This changes the database. Run it?",
-                        theme.style(ThemeRole::DiagnosticWarning),
-                    ),
-                    Line::raw(""),
-                ];
-                lines.extend(sql.lines().map(|line| Line::raw(line.to_string())));
-                crate::database::popup_box(frame, body, " Run SQL ", lines, theme);
-            }
+            Overlay::DbConfirm(confirm) => confirm.render(frame, body, theme),
             Overlay::Doc(text) => {
                 let caret = self.docs.get(self.active).and_then(|doc| {
                     doc.state
@@ -237,7 +227,11 @@ impl App {
                 hint("y", "Copy value"),
                 hint("Esc", "Close"),
             ],
-            Overlay::DbConfirm(_) => vec![hint("Enter", "Run it"), hint("Esc", "Cancel")],
+            Overlay::DbConfirm(confirm) => confirm
+                .hints()
+                .into_iter()
+                .map(|(keys, label)| hint(keys, label))
+                .collect(),
             Overlay::Doc(_) => vec![hint("Esc", "Close"), hint("Any key", "Close and continue")],
             Overlay::KeyCheck(_) => vec![
                 hint("Esc", "Did not arrive"),

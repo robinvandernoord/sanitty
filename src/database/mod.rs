@@ -8,6 +8,7 @@
 //! and draws in the rectangle [`Database::render`] gives back.
 
 pub mod assist;
+pub mod confirm;
 pub mod conn;
 pub mod driver;
 pub mod grid;
@@ -15,8 +16,6 @@ pub mod sql;
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::hash::Hash as _;
-use std::hash::Hasher as _;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -60,6 +59,9 @@ pub enum Outcome {
     /// Run SQL (off the loop), then [`Database::finished`] with this
     /// generation.
     Execute(String, u64),
+    /// A cell edit's UPDATE (off the loop), in a transaction that is undone
+    /// unless it changes exactly one row; then [`Database::finished`].
+    ExecuteOneRow(String, u64),
     /// Put this text in the query editor and focus it.
     Insert(String),
     /// The query editor for this connection is ready: open its file.
@@ -99,8 +101,8 @@ enum Popup {
     },
     /// SQL that writes, shown before it runs.
     Confirm {
-        sql: String,
-        /// Run the grid's SQL again afterwards (a cell edit).
+        confirm: confirm::Confirm,
+        /// A cell edit: one row or nothing, and the grid's SQL again after.
         rerun: bool,
         /// Show the result over the code.
         to_popup: bool,
@@ -333,7 +335,7 @@ impl Database {
             })
         } else {
             self.popup = Some(Popup::Confirm {
-                sql,
+                confirm: confirm::Confirm::new(sql),
                 rerun: false,
                 to_popup,
             });
@@ -351,13 +353,13 @@ impl Database {
     }
 
     /// The write waiting for confirmation, for the popup over the code.
-    pub fn take_confirm(&mut self) -> Option<String> {
+    pub fn take_confirm(&mut self) -> Option<confirm::Confirm> {
         match self.popup.take() {
             Some(Popup::Confirm {
-                sql,
+                confirm,
                 to_popup: true,
                 ..
-            }) => Some(sql),
+            }) => Some(confirm),
             other => {
                 self.popup = other;
                 None
@@ -368,8 +370,14 @@ impl Database {
     fn execute(&mut self, pending: Pending) -> Outcome {
         self.generation += 1;
         let sql = pending.sql.clone();
+        // A cell edit writes one row or nothing.
+        let one_row = pending.rerun;
         self.pending = Some(pending);
-        Outcome::Execute(sql, self.generation)
+        if one_row {
+            Outcome::ExecuteOneRow(sql, self.generation)
+        } else {
+            Outcome::Execute(sql, self.generation)
+        }
     }
 
     /// The schema and engine, once connected, for SQL completion.
@@ -404,6 +412,10 @@ impl Database {
                 if pending.to_popup {
                     return Outcome::Status(format!("SQL failed: {err}"));
                 }
+                // A cell edit that failed (or was undone): the rows stay.
+                if pending.rerun {
+                    return Outcome::Status(format!("Not written: {err}"));
+                }
                 self.error = Some(err);
                 return Outcome::Pending;
             }
@@ -420,15 +432,25 @@ impl Database {
             return Outcome::Popup(Grid::new(result, pending.sql));
         }
         if pending.rerun {
-            // A cell was written: show the table again, in place.
-            let again = self.grid.as_ref().map(|old| Pending {
-                sql: old.sql.clone(),
-                rerun: false,
-                to_popup: false,
-            });
+            // A cell was written: show the rows again, in place, when the
+            // grid's query only reads. One that writes (`... RETURNING`)
+            // never runs again by itself.
+            let engine = self.engine_or_default();
+            let again = self
+                .grid
+                .as_ref()
+                .filter(|old| sql::reads_only(engine, &old.sql))
+                .map(|old| Pending {
+                    sql: old.sql.clone(),
+                    rerun: false,
+                    to_popup: false,
+                });
             return match again {
                 Some(again) => self.execute(again),
-                None => Outcome::Status(grid::summary(&result)),
+                None => Outcome::Status(format!(
+                    "{}; the rows shown are from before (the query changes data, so r asks first)",
+                    grid::summary(&result)
+                )),
             };
         }
         self.error = None;
@@ -538,24 +560,27 @@ impl Database {
                 _ => Outcome::Pending,
             },
             Popup::Confirm {
-                sql,
+                confirm,
                 rerun,
                 to_popup,
-            } => match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
+            } => match confirm.handle_key(key) {
+                confirm::Answer::Run => {
                     let pending = Pending {
-                        sql: sql.clone(),
+                        sql: confirm.sql.clone(),
                         rerun: *rerun,
                         to_popup: *to_popup,
                     };
                     self.popup = None;
                     self.execute(pending)
                 }
-                KeyCode::Esc | KeyCode::Char('n') => {
+                confirm::Answer::Cancel => {
                     self.popup = None;
                     Outcome::Status("Not run".into())
                 }
-                _ => Outcome::Pending,
+                confirm::Answer::NotSeen => {
+                    Outcome::Status("Scroll down to see all of the SQL first".into())
+                }
+                confirm::Answer::Pending => Outcome::Pending,
             },
             Popup::Edit { text, null } => match key.code {
                 KeyCode::Esc => {
@@ -635,27 +660,52 @@ impl Database {
                 table.name
             ));
         }
+        // The same table twice (a self-join): the server names the table,
+        // not which use of it a column comes from, so the row is ambiguous.
+        let statement = sql::split(engine, &grid.sql)
+            .last()
+            .and_then(|range| grid.sql.get(range.clone()))
+            .unwrap_or("");
+        let uses = self.schema.as_ref().map_or(0, |schema| {
+            assist::table_uses(schema, engine, statement, table)
+        });
+        if uses > 1 {
+            return Err(format!(
+                "{} appears more than once in the query, so which row to edit is unclear",
+                table.name
+            ));
+        }
         let mut values = Vec::new();
         for column in &key {
-            let idx = grid
-                .result
-                .origins
-                .iter()
-                .position(|other| {
-                    other.as_ref().is_some_and(|other| {
-                        other.table == origin.table
-                            && other.schema == origin.schema
-                            && other.column == *column
-                    })
+            let mut found = grid.result.origins.iter().enumerate().filter(|(_, other)| {
+                other.as_ref().is_some_and(|other| {
+                    other.table == origin.table
+                        && other.schema == origin.schema
+                        && other.column == *column
                 })
-                .ok_or_else(|| {
-                    format!(
-                        "Add {}'s primary key ({}) to the query to edit its rows",
-                        table.name,
-                        key.join(", ")
-                    )
-                })?;
-            values.push(((*column).to_string(), row.get(idx).cloned().flatten()));
+            });
+            let Some((idx, _)) = found.next() else {
+                return Err(format!(
+                    "Add {}'s primary key ({}) to the query to edit its rows",
+                    table.name,
+                    key.join(", ")
+                ));
+            };
+            if found.next().is_some() {
+                return Err(format!(
+                    "{}.{column} is in the result twice, so which row to edit is unclear",
+                    table.name
+                ));
+            }
+            // `WHERE key IS NULL` could match many rows (SQLite allows NULL
+            // in a primary key that is not an integer).
+            let Some(value) = row.get(idx).cloned().flatten() else {
+                return Err(format!(
+                    "{}.{column} is NULL in this row, so the row cannot be picked out",
+                    table.name
+                ));
+            };
+            values.push(((*column).to_string(), Some(value)));
         }
         Ok(EditTarget {
             table: sql::table_name(engine, &table.schema, &table.name),
@@ -704,7 +754,7 @@ impl Database {
             .collect();
         let sql = sql::update_cell(engine, &target.table, (&target.column, value), &key);
         self.popup = Some(Popup::Confirm {
-            sql,
+            confirm: confirm::Confirm::new(sql),
             rerun: true,
             to_popup: false,
         });
@@ -836,13 +886,10 @@ impl Database {
                 }
                 None => Outcome::Pending,
             },
+            // Run again, asking first when the query changes data.
             KeyCode::Char('r') => {
-                let again = Pending {
-                    sql: grid.sql.clone(),
-                    rerun: false,
-                    to_popup: false,
-                };
-                self.execute(again)
+                let again = grid.sql.clone();
+                self.ask(again, false)
             }
             _ => Outcome::Pending,
         }
@@ -975,7 +1022,7 @@ impl Database {
             Some(Popup::Connections { .. }) => {
                 return vec![("Enter", "Connect"), ("Up/Down", "Move"), ("Esc", "Close")];
             }
-            Some(Popup::Confirm { .. }) => return vec![("Enter", "Run it"), ("Esc", "Cancel")],
+            Some(Popup::Confirm { confirm, .. }) => return confirm.hints(),
             Some(Popup::Edit { .. }) => {
                 return vec![("Enter", "Write"), ("Tab", "NULL"), ("Esc", "Cancel")];
             }
@@ -1224,8 +1271,8 @@ impl Database {
         }
     }
 
-    pub fn render_popup(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let Some(popup) = &self.popup else { return };
+    pub fn render_popup(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let Some(popup) = &mut self.popup else { return };
         match popup {
             Popup::Connections { selected } => {
                 let lines: Vec<Line> = self
@@ -1249,17 +1296,7 @@ impl Database {
                     .collect();
                 popup_box(frame, area, " Connections ", lines, theme);
             }
-            Popup::Confirm { sql, .. } => {
-                let mut lines: Vec<Line> = vec![
-                    Line::styled(
-                        "This changes the database. Run it?",
-                        theme.style(ThemeRole::DiagnosticWarning),
-                    ),
-                    Line::raw(""),
-                ];
-                lines.extend(sql.lines().map(|line| Line::raw(line.to_string())));
-                popup_box(frame, area, " Run SQL ", lines, theme);
-            }
+            Popup::Confirm { confirm, .. } => confirm.render(frame, area, theme),
             Popup::Edit { text, null } => {
                 let column = self
                     .grid
@@ -1344,17 +1381,7 @@ fn selected<'a>(line: Line<'a>, theme: &Theme, focused: bool) -> Line<'a> {
 
 /// Where this workspace's database state lives: outside the project.
 fn state_dir(root: &Path) -> Option<PathBuf> {
-    let dir = dirs::state_dir().or_else(dirs::data_local_dir)?;
-    let name = root.file_name().map_or_else(
-        || "root".to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root.hash(&mut hasher);
-    Some(
-        dir.join("sanitty")
-            .join(format!("db-{name}-{:016x}", hasher.finish())),
-    )
+    crate::statefile::path("db", root, "")
 }
 
 /// The query editor's file for a connection, made when missing.

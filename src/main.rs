@@ -19,6 +19,7 @@ mod review;
 mod search;
 mod settings;
 mod sig;
+mod statefile;
 mod stylenav;
 mod styles;
 mod tshl;
@@ -84,11 +85,11 @@ pub enum Event {
     /// Async launcher results: search generation, kind, items.
     Launcher(u64, picker::Kind, Vec<picker::Item>),
     /// The sources the Review view can show, for its picker.
-    ReviewSources(Vec<review::git::SourceInfo>),
+    ReviewSources(u64, Vec<review::git::SourceInfo>),
     /// Commits or pull requests for the Review view to pick from.
-    ReviewChoices(Result<review::git::Choices, String>),
+    ReviewChoices(u64, Result<review::git::Choices, String>),
     /// A diff for the Review view, or why it could not be loaded.
-    ReviewLoaded(Result<review::git::Loaded, String>),
+    ReviewLoaded(u64, Result<review::git::Loaded, String>),
     /// Database connections found for the workspace, and problems finding them.
     DbFound(Vec<database::conn::Connection>, Vec<String>),
     /// A connection opened (with its schema) or failed, for the connect

@@ -61,7 +61,7 @@ enum Overlay {
     /// The result of Run SQL from a file, over the code.
     DbResult(crate::database::grid::Grid),
     /// SQL from a file that writes, shown before it runs.
-    DbConfirm(String),
+    DbConfirm(crate::database::confirm::Confirm),
 }
 
 /// The full-screen view on screen.
@@ -147,6 +147,9 @@ pub struct App {
     db_return: Option<(Option<PathBuf>, bool)>,
     /// The query editor's file, once connected.
     db_scratch: Option<PathBuf>,
+    /// Where the last jump (definition, usages, implementation) was asked
+    /// from: its answer only counts while the caret is still there.
+    nav_asked: Option<(PathBuf, LineCol)>,
     /// Where the editor was last drawn, for popups at its caret.
     editor_area: ratatui::layout::Rect,
     /// What the main loop should do next, if anything.
@@ -199,6 +202,7 @@ impl App {
             db_return: None,
             db_scratch: None,
             editor_area: ratatui::layout::Rect::default(),
+            nav_asked: None,
             enhanced_keys: false,
         }
     }
@@ -243,22 +247,9 @@ impl App {
                 self.refresh_completion();
             }
             Event::Completions(generation, answer) => self.on_completions(generation, answer),
-            Event::ReviewSources(sources) => {
-                if let Some(review) = &mut self.review {
-                    review.pick(sources);
-                }
-            }
-            Event::ReviewChoices(result) => {
-                if let Some(review) = &mut self.review {
-                    let outcome = review.choices(result);
-                    self.review_outcome(outcome);
-                }
-            }
-            Event::ReviewLoaded(result) => {
-                if let Some(review) = &mut self.review {
-                    review.loaded(result);
-                }
-            }
+            event @ (Event::ReviewSources(..)
+            | Event::ReviewChoices(..)
+            | Event::ReviewLoaded(..)) => self.review_event(event),
             event @ (Event::DbFound(..)
             | Event::DbConnected(..)
             | Event::DbSchema(..)

@@ -238,6 +238,15 @@ fn table_refs<'a>(schema: &'a Schema, engine: Engine, sql: &str) -> Vec<(String,
     out
 }
 
+/// How many times a statement uses `table` (in `from`, `join`, `update`,
+/// `into`): more than once is a self-join.
+pub fn table_uses(schema: &Schema, engine: Engine, sql: &str, table: &Table) -> usize {
+    table_refs(schema, engine, sql)
+        .iter()
+        .filter(|(_, used)| used.schema == table.schema && used.name == table.name)
+        .count()
+}
+
 /// A table by name, case-insensitively; with a schema name, in that schema.
 fn find_table<'a>(schema: &'a Schema, in_schema: Option<&str>, name: &str) -> Option<&'a Table> {
     let mut same = schema.tables.iter().filter(|table| {
@@ -582,6 +591,21 @@ mod tests {
                 ("auth_user", "auth_user")
             ]
         );
+    }
+
+    #[test]
+    fn counts_a_self_join() {
+        let schema = schema();
+        let Some(user) = schema.tables.first() else {
+            return;
+        };
+        let count = |sql| table_uses(&schema, Engine::Postgres, sql, user);
+        assert_eq!(count("select * from auth_user"), 1);
+        assert_eq!(
+            count("select * from auth_user a join auth_user b on a.id = b.id"),
+            2
+        );
+        assert_eq!(count("select * from shop_order"), 0);
     }
 
     #[test]

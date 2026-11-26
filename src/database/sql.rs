@@ -39,10 +39,17 @@ fn skip(engine: Engine, text: &str, idx: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let next = bytes.get(idx + 1);
     Some(match *bytes.get(idx)? {
-        quote @ (b'\'' | b'"' | b'`') => skip_quoted(bytes, idx, quote),
+        quote @ (b'\'' | b'"' | b'`') => {
+            skip_quoted(bytes, idx, quote, backslash_escapes(engine, bytes, idx))
+        }
         b'-' if next == Some(&b'-') => skip_line(bytes, idx),
         b'#' if engine == Engine::MySql => skip_line(bytes, idx),
-        b'/' if next == Some(&b'*') => skip_block(bytes, idx),
+        // MySQL runs `/*! ... */` as code: it is read as such, never skipped.
+        b'/' if next == Some(&b'*')
+            && !(engine == Engine::MySql && bytes.get(idx + 2) == Some(&b'!')) =>
+        {
+            skip_block(bytes, idx)
+        }
         b'$' if engine == Engine::Postgres => skip_dollar(text, idx),
         _ => return None,
     })
@@ -100,9 +107,64 @@ pub fn reads(engine: Engine, statement: &str) -> bool {
                 "insert" | "update" | "delete" | "merge" | "into"
             )
         }),
-        "pragma" => !statement.contains('='),
+        "pragma" => pragma_reads(statement),
         _ => false,
     }
+}
+
+/// SQLite pragmas that only report, even when given an argument
+/// (`PRAGMA table_info(item)`).
+const PRAGMAS_THAT_REPORT: &[&str] = &[
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+    "foreign_key_check",
+    "integrity_check",
+    "quick_check",
+    "database_list",
+    "collation_list",
+    "function_list",
+    "module_list",
+    "pragma_list",
+    "compile_options",
+];
+
+/// SQLite pragmas that do something even without an argument.
+const PRAGMAS_THAT_ACT: &[&str] = &[
+    "optimize",
+    "shrink_memory",
+    "incremental_vacuum",
+    "wal_checkpoint",
+];
+
+/// Whether a `PRAGMA` only reads: one that reports, or one without an
+/// argument that does not act. Any other with an argument (`= value` or
+/// `(value)`) can change the database.
+fn pragma_reads(statement: &str) -> bool {
+    let rest = statement
+        .trim_start()
+        .get("pragma".len()..)
+        .unwrap_or("")
+        .trim_start();
+    let name_end = rest
+        .find(|chr: char| !(chr.is_ascii_alphanumeric() || chr == '_' || chr == '.'))
+        .unwrap_or(rest.len());
+    let name = rest.get(..name_end).unwrap_or("").to_ascii_lowercase();
+    // `main.table_info`: the schema does not matter.
+    let name = name.rsplit('.').next().unwrap_or("");
+    let has_argument = rest
+        .get(name_end..)
+        .unwrap_or("")
+        .trim_start()
+        .starts_with(['=', '(']);
+    if PRAGMAS_THAT_REPORT.contains(&name) {
+        return true;
+    }
+    !has_argument && !PRAGMAS_THAT_ACT.contains(&name)
 }
 
 /// The lower-cased words of a statement, outside strings, quoted names and
@@ -145,13 +207,32 @@ fn push_trimmed(engine: Engine, text: &str, range: Range<usize>, out: &mut Vec<R
     out.push(range.start + lead..range.end - trail);
 }
 
-/// Past a quoted string or name; a doubled quote stays inside. A backslash
-/// escapes the next character in single-quoted strings (MySQL's default,
-/// and harmless elsewhere for finding the end).
-fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+/// Whether a backslash escapes the next character in the single-quoted
+/// string starting at `idx`: in MySQL (its default), and in Postgres only in
+/// `E'...'` strings. Elsewhere it is an ordinary character, and treating it as
+/// an escape would hide the string's real end (`'\'; DELETE ...`).
+fn backslash_escapes(engine: Engine, bytes: &[u8], idx: usize) -> bool {
+    match engine {
+        Engine::MySql => true,
+        Engine::Postgres => {
+            let before = idx.checked_sub(1).and_then(|pos| bytes.get(pos));
+            let word_before = idx
+                .checked_sub(2)
+                .and_then(|pos| bytes.get(pos))
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+            matches!(before, Some(b'E' | b'e')) && !word_before
+        }
+        Engine::Sqlite => false,
+    }
+}
+
+/// Past a quoted string or name; a doubled quote stays inside. With
+/// `backslash`, a backslash escapes the next character of a single-quoted
+/// string.
+fn skip_quoted(bytes: &[u8], start: usize, quote: u8, backslash: bool) -> usize {
     let mut idx = start + 1;
     while let Some(&byte) = bytes.get(idx) {
-        if byte == b'\\' && quote == b'\'' {
+        if byte == b'\\' && quote == b'\'' && backslash {
             idx += 2;
         } else if byte == quote {
             if bytes.get(idx + 1) == Some(&quote) {
@@ -285,6 +366,34 @@ mod tests {
             ]
         );
         assert_eq!(parts("select 'it''s; fine'"), ["select 'it''s; fine'"]);
+    }
+
+    #[test]
+    fn writes_cannot_pass_as_reads() {
+        use Engine::{MySql, Postgres, Sqlite};
+        // Each of these changes data and must be confirmed.
+        assert!(!reads_only(Sqlite, "PRAGMA user_version(123)"));
+        assert!(!reads_only(Sqlite, "PRAGMA journal_mode = wal"));
+        assert!(!reads_only(Sqlite, "pragma main.writable_schema(1)"));
+        assert!(!reads_only(Sqlite, "PRAGMA optimize"));
+        // A backslash is an ordinary character here: the string ends at the
+        // second quote and a DELETE follows.
+        assert!(!reads_only(Postgres, "SELECT '\\'; DELETE FROM users; --'"));
+        assert!(!reads_only(Sqlite, "SELECT '\\'; DELETE FROM users; --'"));
+        // MySQL runs its executable comments.
+        assert!(!reads_only(MySql, "SELECT 1; /*! DELETE FROM users */"));
+        assert!(!reads_only(MySql, "/*!40101 SET NAMES utf8 */"));
+
+        // And these still only read.
+        assert!(reads_only(Sqlite, "PRAGMA table_info(item)"));
+        assert!(reads_only(Sqlite, "PRAGMA journal_mode"));
+        assert!(reads_only(MySql, "SELECT 'it\\'s; fine'"));
+        assert!(reads_only(Postgres, "SELECT E'it\\'s; fine'"));
+        assert!(reads_only(Postgres, "SELECT '/*! not mysql */'"));
+        assert!(reads_only(
+            Postgres,
+            "SELECT 1 /*! a comment in Postgres */"
+        ));
     }
 
     #[test]

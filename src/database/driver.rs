@@ -212,16 +212,22 @@ fn url_has_password(conn: &Connection) -> bool {
     })
 }
 
-/// Run every statement in `sql`.
+/// Run every statement in `sql`, keeping at most `database.max_rows`
+/// (settings) of the result: SQL someone typed.
 pub async fn run(pool: &Pool, sql: &str) -> Result<ResultSet, String> {
+    run_keeping(pool, sql, crate::settings::get().database.max_rows).await
+}
+
+/// [`run`], keeping at most `limit` rows.
+async fn run_keeping(pool: &Pool, sql: &str, limit: usize) -> Result<ResultSet, String> {
     let started = Instant::now();
     let text = sql;
     let reads = super::sql::reads_only(pool.engine(), text);
     let sql = sqlx::AssertSqlSafe(text.to_string());
     let mut result = match pool {
-        Pool::Postgres(pool) => collect(sqlx::raw_sql(sql).fetch_many(pool)).await,
-        Pool::MySql(pool) => collect(sqlx::raw_sql(sql).fetch_many(pool)).await,
-        Pool::Sqlite(pool) => run_sqlite(pool, sql).await,
+        Pool::Postgres(pool) => collect(sqlx::raw_sql(sql).fetch_many(pool), limit).await,
+        Pool::MySql(pool) => collect(sqlx::raw_sql(sql).fetch_many(pool), limit).await,
+        Pool::Sqlite(pool) => run_sqlite(pool, sql, limit).await,
     }
     .map_err(|err| error_text(&err))?;
     // A read at the end that found nothing still shows its columns.
@@ -270,7 +276,11 @@ async fn resolve_relations(pool: &PgPool, result: &mut ResultSet) {
          where a.attrelid in ({}) and a.attnum > 0",
         list.join(", ")
     );
-    let found = collect(sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).fetch_many(pool)).await;
+    let found = collect(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).fetch_many(pool),
+        usize::MAX,
+    )
+    .await;
     let names: std::collections::HashMap<(String, String), Origin> = found
         .map(|found| found.rows)
         .unwrap_or_default()
@@ -298,25 +308,82 @@ async fn resolve_relations(pool: &PgPool, result: &mut ResultSet) {
 /// `OID_MARK` and the OID, the column field the column number.
 const OID_MARK: &str = "\u{0}oid:";
 
+/// A cell edit's UPDATE: in a transaction that is committed only when it
+/// changed exactly one row, and undone otherwise, so an edit can never
+/// change several rows (or a row other than the one shown, if its key
+/// changed meanwhile). MySQL counts only rows whose value really changed,
+/// so there writing the value a cell already has changes zero rows, which
+/// is fine.
+pub async fn update_one_row(pool: &Pool, sql: &str) -> Result<ResultSet, String> {
+    let started = Instant::now();
+    let text = || sqlx::AssertSqlSafe(sql.to_string());
+    let failed = |err: sqlx::Error| error_text(&err);
+    macro_rules! in_transaction {
+        ($pool:expr) => {{
+            let mut tx = $pool.begin().await.map_err(failed)?;
+            let done = sqlx::raw_sql(text())
+                .execute(&mut *tx)
+                .await
+                .map_err(failed)?;
+            let changed = done.rows_affected();
+            let unchanged_in_mysql = changed == 0 && pool.engine() == Engine::MySql;
+            if changed == 1 || unchanged_in_mysql {
+                tx.commit().await.map_err(failed)?;
+            } else {
+                tx.rollback().await.map_err(failed)?;
+            }
+            (changed, unchanged_in_mysql)
+        }};
+    }
+    let (changed, unchanged) = match pool {
+        Pool::Postgres(pool) => in_transaction!(pool),
+        Pool::MySql(pool) => in_transaction!(pool),
+        Pool::Sqlite(pool) => in_transaction!(pool),
+    };
+    match changed {
+        1 => {}
+        0 if unchanged => {}
+        0 => {
+            return Err(
+                "The row was not found (changed or deleted since?); nothing was written".into(),
+            );
+        }
+        many => {
+            return Err(format!(
+                "The update would change {many} rows instead of one, so nothing was written"
+            ));
+        }
+    }
+    Ok(ResultSet {
+        affected: changed,
+        statements: 1,
+        elapsed: started.elapsed(),
+        ..ResultSet::default()
+    })
+}
+
 /// SQLite reports the last insert, update or delete's count again for a
 /// statement that changes no rows (`CREATE`), so the count comes from
 /// `total_changes()` before and after, on the same connection.
 async fn run_sqlite(
     pool: &SqlitePool,
     sql: sqlx::AssertSqlSafe<String>,
+    limit: usize,
 ) -> Result<ResultSet, sqlx::Error> {
     let mut conn = pool.acquire().await?;
     let total = "select total_changes()";
     let before: i64 = sqlx::query_scalar(total).fetch_one(&mut *conn).await?;
-    let mut result = collect(sqlx::raw_sql(sql).fetch_many(&mut *conn)).await?;
+    let mut result = collect(sqlx::raw_sql(sql).fetch_many(&mut *conn), limit).await?;
     let after: i64 = sqlx::query_scalar(total).fetch_one(&mut *conn).await?;
     result.affected = u64::try_from(after.saturating_sub(before)).unwrap_or(0);
     Ok(result)
 }
 
-/// Gather a statement stream: the rows of the last statement with rows.
+/// Gather a statement stream: the rows of the last statement with rows,
+/// at most `limit` of them (the rest are counted as cut off, not kept).
 async fn collect<R, Q>(
     mut stream: futures_util::stream::BoxStream<'_, Result<Either<Q, R>, sqlx::Error>>,
+    limit: usize,
 ) -> Result<ResultSet, sqlx::Error>
 where
     R: sqlx::Row + Origins,
@@ -355,7 +422,7 @@ where
                         .collect();
                     origins = (0..row.len()).map(|idx| row.origin(idx)).collect();
                 }
-                if rows.len() >= crate::settings::get().database.max_rows {
+                if rows.len() >= limit {
                     truncated = true;
                     continue;
                 }
@@ -545,7 +612,9 @@ pub async fn schema(pool: &Pool) -> Result<Schema, String> {
              order by m.name, p.cid"
         }
     };
-    let result = run(pool, sql).await?;
+    // The whole schema, however many columns: the row limit is for results
+    // shown in the grid.
+    let result = run_keeping(pool, sql, usize::MAX).await?;
     Ok(schema_from_rows(result.rows))
 }
 
@@ -668,13 +737,39 @@ mod tests {
         assert_eq!(empty.rows.len(), 0);
         assert_eq!(empty.origins.first(), Some(&origin("id")));
 
+        // A cell edit changes one row or nothing: two rows with a NULL text
+        // key both match `IS NULL`, so it is undone.
+        run(
+            &pool,
+            "create table loose (k text primary key, v text);
+             insert into loose values (null, 'a'), (null, 'b');",
+        )
+        .await?;
+        let many = update_one_row(&pool, "update loose set v = 'x' where k is null").await;
+        assert!(many.is_err_and(|err| err.contains("2 rows")));
+        let kept = run(&pool, "select v from loose order by v").await?;
+        assert_eq!(kept.rows, [vec![Some("a".into())], vec![Some("b".into())]]);
+        let one = update_one_row(&pool, "update item set name = 'pencil' where id = 1").await?;
+        assert_eq!(one.affected, 1);
+        let none = update_one_row(&pool, "update item set name = 'x' where id = 99").await;
+        assert!(none.is_err());
+
+        // The row limit cuts off what is shown, never the schema.
+        let cut = run_keeping(
+            &pool,
+            "select * from loose union all select * from loose",
+            2,
+        )
+        .await?;
+        assert_eq!((cut.rows.len(), cut.truncated), (2, true));
+
         let schema = schema(&pool).await?;
         let listed: Vec<(&str, bool)> = schema
             .tables
             .iter()
             .map(|table| (table.name.as_str(), table.view))
             .collect();
-        assert_eq!(listed, [("cheap", true), ("item", false)]);
+        assert_eq!(listed, [("cheap", true), ("item", false), ("loose", false)]);
         let item = schema.tables.iter().find(|table| table.name == "item");
         assert_eq!(item.map(Table::primary_key), Some(vec!["id"]));
         assert_eq!(
