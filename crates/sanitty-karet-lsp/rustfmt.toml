@@ -1,0 +1,3 @@
+# The style of upstream karet (this crate is its karet-lsp with two fixes), so
+# formatting the workspace leaves it as published.
+match_block_trailing_comma = true

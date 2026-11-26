@@ -17,17 +17,45 @@ sanitty is a non-modal IDE written in Rust that runs entirely in the terminal. J
 
 ## Status
 
-sanitty is an early personal project. The editor, language-server, review and database milestones are complete, and so are multi-caret editing and a settings file. See [PLAN.md](PLAN.md).
+Version 1. See [CHANGELOG.md](CHANGELOG.md) for the changes in each release, [Known limits](#known-limits) below, and [PLAN.md](PLAN.md) for the design.
 
-## Build and run
+## Install
 
-You need Rust 1.94 or newer and a C compiler for the Tree-sitter parsers.
+sanitty runs on Linux (amd64 and arm64). The release binaries are static, so they work on any distribution.
+
+**apt** (Debian and Ubuntu). The packages live in the Tileception apt repository:
 
 ```sh
-git clone https://github.com/robinvandernoord/sanitty.git
-cd sanitty
-cargo build --release --locked
-./target/release/sanitty /path/to/project
+sudo install -d -m 755 /etc/apt/keyrings
+curl -fsSL https://apt.tileception.space/tileception.gpg | sudo tee /etc/apt/keyrings/tileception.gpg >/dev/null
+sudo tee /etc/apt/sources.list.d/tileception.sources <<SRC
+Types: deb
+URIs: https://apt.tileception.space
+Suites: $(. /etc/os-release; echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: main
+Signed-By: /etc/apt/keyrings/tileception.gpg
+SRC
+sudo apt update && sudo apt install sanitty
+```
+
+`sudo apt upgrade` then brings new versions.
+
+**cargo-binstall** downloads the release binary; run it again to upgrade:
+
+```sh
+cargo binstall sanitty
+```
+
+**From source**, with Rust 1.94 or newer and a C compiler for the Tree-sitter parsers:
+
+```sh
+cargo install sanitty
+```
+
+## Run
+
+```sh
+sanitty /path/to/project
 ```
 
 Pass a directory to open it as the workspace, or a file to open that file. With no path, sanitty starts in the current directory. Inside a Git checkout, the workspace is the whole repository. Press `F1` to see every action and its key.
@@ -141,8 +169,20 @@ Queries are kept per connection in sanitty's state directory (`~/.local/state/sa
 
 Set `SANITTY_LOG` to a file path to record debug output, including language-server messages.
 
+## Known limits
+
+- In terminals without the kitty keyboard protocol (tmux, older terminals), Ctrl+Shift+Z arrives as Ctrl+Z (undo instead of redo) and Ctrl+Alt+J as Alt+Enter (Run SQL instead of Select All Occurrences). T3 and Ghostty send both correctly.
+- Rust files of several MB with doc comments take about half a second per keystroke to recolour.
+- Colours cannot be changed yet: there is one built-in dark theme.
+
+## Releasing
+
+Releases are made with [vommit](https://github.com/educationwarehouse/vommit) (run `vommit authenticate` once for crates.io): `vommit release` bumps the version in `Cargo.toml` from the conventional commits since the last tag, writes the `CHANGELOG.md` entry, commits and tags `vX.Y.Z`, pushes, and publishes the crates to crates.io (`scripts/publish.sh`: `sanitty-karet-lsp` only when its version is new, then `sanitty`).
+
+The tag starts the `Release` workflow. It builds static binaries for amd64 and arm64, attaches them (as archives and `.deb` packages) to a GitHub release with the changelog entry as notes, and adds the `.deb` packages to the apt repository in every suite it serves. Running the workflow by hand only builds, to check the binaries without releasing. The apt step needs the `apt` environment on GitHub (`APT_SSH_HOST`, `APT_SSH_KEY`, `APT_SSH_KNOWN_HOSTS`); see the `tileception-apt` repository.
+
 ## License
 
 sanitty is released under the MIT license. See [LICENSE](LICENSE).
 
-The vendored `karet-lsp` 0.8.0 is used under MIT and carries two fixes for hover Markdown and diagnostic requests. See [SANITTY-PATCH.md](vendor/karet-lsp/SANITTY-PATCH.md).
+sanitty uses `karet-lsp` 0.8.0 with two fixes, for hover Markdown and diagnostic requests, published as the crate `sanitty-karet-lsp` under MIT. See [SANITTY-PATCH.md](crates/sanitty-karet-lsp/SANITTY-PATCH.md).

@@ -1,9 +1,17 @@
 [package]
 name = "sanitty"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
+rust-version = "1.100"
 description = "A little sanity for your tty: a non-modal IDE for the terminal"
 license = "MIT"
+authors = ["Robin van der Noord <robinvandernoord@gmail.com>"]
+repository = "https://github.com/robinvandernoord/sanitty"
+readme = "README.md"
+keywords = ["ide", "editor", "terminal", "tui", "lsp"]
+categories = ["command-line-utilities", "text-editors", "development-tools"]
+# CI workflows are for the repository, not the crate.
+exclude = [".github/"]
 
 [[bin]]
 name = "sanitty"
@@ -19,7 +27,9 @@ karet-syntax = { version = "0.8.0", features = [
     "lang-toml", "lang-yaml", "lang-markdown", "lang-sql", "lang-html", "lang-css",
     "lang-bash", "lang-containerfile", "lang-scss", "lang-sass", "lang-less",
 ] }
-karet-lsp = "0.8.0"
+# karet-lsp 0.8.0 with two fixes, published as its own crate so sanitty can be
+# installed from crates.io (see crates/sanitty-karet-lsp/SANITTY-PATCH.md).
+karet-lsp = { package = "sanitty-karet-lsp", version = "0.8.0", path = "crates/sanitty-karet-lsp" }
 karet-search = "0.8.0"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
@@ -45,9 +55,51 @@ sqlx = { version = "0.9.1", default-features = false, features = [
 ] }
 futures-util = { version = "0.3", default-features = false }
 
-# karet-lsp 0.8.0 with two fixes (see vendor/karet-lsp/SANITTY-PATCH.md).
-[patch.crates-io]
-karet-lsp = { path = "vendor/karet-lsp" }
+# One static binary per architecture is shipped as is: stripped, and linked
+# across crates for size.
+[profile.release]
+strip = true
+lto = "thin"
+
+# `cargo binstall sanitty` downloads the release's archive instead of
+# building (named as in cargo-plane). The binaries are static (musl), so they
+# serve the usual gnu targets too.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.tgz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-x86_64-unknown-linux-musl-v{ version }.tgz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-aarch64-unknown-linux-musl-v{ version }.tgz"
+
+# The .deb for the apt repository (cargo deb --target <musl target>
+# --no-build): one static binary, so no library dependencies.
+[package.metadata.deb]
+section = "editors"
+priority = "optional"
+depends = ""
+recommends = "git, ca-certificates"
+suggests = "docker-compose-plugin"
+extended-description = """\
+A non-modal IDE that runs entirely in the terminal and over SSH: \
+language servers (definition, usages, rename, problems, completion), \
+a Review view for diffs, commits and pull requests with comments, \
+a Database view for PostgreSQL, MySQL/MariaDB and SQLite, and \
+multi-caret editing. Most shortcuts use Alt, so terminals built into \
+other apps can keep their Ctrl keys."""
+assets = [
+    ["target/release/sanitty", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/sanitty/README.md", "644"],
+    ["CHANGELOG.md", "usr/share/doc/sanitty/CHANGELOG.md", "644"],
+]
+
+# The karet-lsp fork is a member, published with sanitty (`cargo publish
+# --workspace`); commands run in the root act on sanitty alone.
+[workspace]
+members = ["crates/*"]
 
 [lints.clippy]
 # Hard rules: no panicking shortcuts in the IDE.

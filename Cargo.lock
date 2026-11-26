@@ -1105,20 +1105,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "karet-lsp"
-version = "0.8.0"
-dependencies = [
- "karet-core",
- "karet-jsonrpc",
- "lsp-types",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "karet-search"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2062,13 +2048,13 @@ dependencies = [
  "karet-core",
  "karet-diff",
  "karet-editor",
- "karet-lsp",
  "karet-search",
  "karet-syntax",
  "karet-text",
  "karet-theme",
  "nucleo-matcher",
  "ratatui",
+ "sanitty-karet-lsp",
  "serde",
  "serde_json",
  "sqlx",
@@ -2078,6 +2064,20 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "sanitty-karet-lsp"
+version = "0.8.0"
+dependencies = [
+ "karet-core",
+ "karet-jsonrpc",
+ "lsp-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

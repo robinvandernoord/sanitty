@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 rust-version = "1.92"
-name = "karet-lsp"
+name = "sanitty-karet-lsp"
 version = "0.8.0"
 authors = ["Justin Chung"]
 build = false
@@ -21,9 +21,9 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Async LSP client for karet TUI editors (diagnostics, completion, hover, goto, symbols, inlay hints, …)."
+description = "karet-lsp 0.8.0 (by Justin Chung) with two fixes, for sanitty: Markdown hover and TypeScript 7 diagnostics. Use karet-lsp itself once a release has them."
 homepage = "https://github.com/getkono/karet"
-readme = "README.md"
+readme = "SANITTY-PATCH.md"
 keywords = [
     "tui",
     "editor",
@@ -34,8 +34,8 @@ categories = [
     "text-editors",
     "command-line-utilities",
 ]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/getkono/karet"
+license = "MIT"
+repository = "https://github.com/robinvandernoord/sanitty"
 
 [lib]
 name = "karet_lsp"

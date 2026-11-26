@@ -4,8 +4,11 @@ A PyCharm-flavoured terminal IDE built on the published `karet-*` crates. It run
 the office PC over SSH (from Ghostty, sometimes the T3 integrated terminal), so files,
 language servers, git, docker and databases are all local to it.
 
-Status: approved plan; shortcuts are starting defaults. Milestones 1 to 4 are done;
-milestone 5 (Polish) is built: the settings file and multi-caret editing.
+Status: all five milestones are done; v1.0.0 (see CHANGELOG.md). `vommit release` tags
+and publishes the crates (`sanitty` and the karet-lsp fork `sanitty-karet-lsp`) to
+crates.io; the tag makes CI build static binaries for amd64 and arm64 for the GitHub
+release (what `cargo binstall sanitty` downloads) and add `.deb` packages to the
+Tileception apt repository in every suite it serves.
 
 ## Principles
 
@@ -380,7 +383,7 @@ Config lives in `~/.config/sanitty/` (keymap, settings) and per project in
    ports) and SQLite. A read that finds no rows still shows its column headers (the
    server prepares the statement for them), and MySQL's `#` comments are recognised on
    MySQL connections only.
-5. **Polish** (built, awaiting demo): multi-caret, settings file.
+5. **Polish** (done): multi-caret, settings file.
    - Multi-caret (built): `Alt+Up`/`Alt+Down` add a caret above/below, `Alt+A` adds the
      next occurrence of the word under the caret (the first press selects it) or of the
      selection, `Alt+U` removes the last added caret (walks back caret operations),

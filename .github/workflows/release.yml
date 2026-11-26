@@ -1,0 +1,231 @@
+name: Release
+
+# `vommit release` publishes the crates and pushes a vX.Y.Z tag (matching the
+# version in Cargo.toml). The tag builds static (musl) binaries for amd64 and
+# arm64, one per architecture for every Linux, and:
+#   - attaches an archive per target and the .deb packages, with SHA256SUMS,
+#     to a GitHub release with the notes from CHANGELOG.md. `cargo binstall
+#     sanitty` downloads these archives ([package.metadata.binstall]);
+#   - adds the .deb packages to the apt repository at APT_URL, in every suite
+#     it serves. It uses the repository's `add` command, which never changes
+#     the suites served (tileception's releases own that list).
+# The workflow does not publish to crates.io: vommit does that.
+#
+# Running it by hand (Actions, Run workflow) only builds, so the archives and
+# packages can be checked without releasing anything.
+#
+# A prerelease (1.2.0-rc.1, tag v1.2.0-rc.1) goes to the apt repository's pre
+# component, versioned 1.2.0~rc.1-1 so the 1.2.0 release replaces it, and its
+# GitHub release is marked as a prerelease.
+#
+# The apt job needs the `apt` environment (Settings, Environments):
+# APT_SSH_HOST, APT_SSH_KEY and APT_SSH_KNOWN_HOSTS as secrets, and
+# APT_SSH_PORT and APT_URL as variables when not 2222 and
+# https://apt.tileception.space.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_ZIGBUILD_VERSION: '0.24.1'
+  ZIGLANG_VERSION: '0.17.1'
+  CARGO_DEB_VERSION: '3.8.0'
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      deb: ${{ steps.version.outputs.deb }}
+      component: ${{ steps.version.outputs.component }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check version
+        id: version
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "sanitty") | .version')
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match crate version v$version" >&2
+            exit 1
+          fi
+          if [[ "$version" == *-* ]]; then
+            component=pre prerelease=true
+          else
+            component=main prerelease=false
+          fi
+          # cargo-deb's spelling: 1.2.0-rc.1 becomes 1.2.0~rc.1-1.
+          deb="$(sed 's/-/~/' <<< "$version")-1"
+          echo "$version: Debian version $deb, apt component $component"
+          {
+            echo "version=$version"
+            echo "deb=$deb"
+            echo "component=$component"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+      DEB_VERSION: ${{ needs.version.outputs.deb }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust and the cross-build tools
+        # zig is the C compiler (tree-sitter parsers, SQLite) for both targets.
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable "$TARGET"
+          # The runner's Python is the system's; it is thrown away after the job.
+          python3 -m pip install --user --break-system-packages "ziglang==$ZIGLANG_VERSION"
+          curl -fsSL "https://github.com/rust-cross/cargo-zigbuild/releases/download/v$CARGO_ZIGBUILD_VERSION/cargo-zigbuild-x86_64-unknown-linux-gnu.tar.xz" \
+            | tar -xJ -C ~/.cargo/bin --strip-components=1
+          cargo +stable install cargo-deb --locked --version "$CARGO_DEB_VERSION"
+      - name: Build
+        run: |
+          cargo +stable zigbuild --release --locked -p sanitty --target "$TARGET"
+          file "target/$TARGET/release/sanitty" | tee /dev/stderr | grep -q 'statically linked'
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/sanitty-$TARGET-v$VERSION.tgz" -C "target/$TARGET/release" sanitty \
+            -C "$GITHUB_WORKSPACE" LICENSE README.md CHANGELOG.md
+          cargo +stable deb -p sanitty --target "$TARGET" --no-build --no-strip \
+            --deb-version "$DEB_VERSION" --output dist/
+          ls -la dist
+          dpkg-deb --info dist/*.deb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sanitty-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish release assets
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: sanitty-*
+          path: dist
+          merge-multiple: true
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        shell: bash
+        run: |
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          # This version's CHANGELOG.md entry ("## vX.Y.Z (date)"), without
+          # its heading.
+          awk -v heading="## v$VERSION " '
+            /^## / { if (found) exit; found = index($0, heading) == 1; next }
+            found' CHANGELOG.md > notes.md
+          [[ -s notes.md ]] || { echo "CHANGELOG.md has no entry for v$VERSION" >&2; exit 1; }
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "sanitty $VERSION" \
+              --notes-file notes.md --prerelease="$PRERELEASE"
+          fi
+
+  apt:
+    name: Add to the apt repository
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    environment:
+      name: apt
+      url: ${{ vars.APT_URL || 'https://apt.tileception.space' }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      APT_SSH_HOST: ${{ secrets.APT_SSH_HOST }}
+      APT_SSH_PORT: ${{ vars.APT_SSH_PORT || '2222' }}
+      APT_SSH_KEY: ${{ secrets.APT_SSH_KEY }}
+      APT_SSH_KNOWN_HOSTS: ${{ secrets.APT_SSH_KNOWN_HOSTS }}
+      APT_URL: ${{ vars.APT_URL || 'https://apt.tileception.space' }}
+      COMPONENT: ${{ needs.version.outputs.component }}
+      DEB_VERSION: ${{ needs.version.outputs.deb }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: sanitty-*
+          path: built
+          merge-multiple: true
+      - name: SSH to the apt repository
+        run: |
+          : "${APT_SSH_HOST:?set the APT_SSH_HOST secret}" "${APT_SSH_KEY:?set the APT_SSH_KEY secret}" "${APT_SSH_KNOWN_HOSTS:?set the APT_SSH_KNOWN_HOSTS secret}"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$APT_SSH_KEY" > ~/.ssh/apt
+          printf '%s\n' "$APT_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/apt ~/.ssh/known_hosts
+      - name: Add to every suite served
+        # The binary is static, so the same .deb serves every suite. `add`
+        # only goes into suites already served and never changes that list.
+        run: |
+          apt_repo() { ssh -i ~/.ssh/apt -p "$APT_SSH_PORT" -o BatchMode=yes publish@"$APT_SSH_HOST" "$@"; }
+          suites=$(apt_repo suites)
+          [[ -n "$suites" ]] || { echo "the apt repository serves no suites" >&2; exit 1; }
+          echo "suites served: $suites"
+          for suite in $suites; do
+            mkdir -p "dist/$suite"
+            cp built/*.deb "dist/$suite/"
+          done
+          find dist -type f | sort
+          tar -C dist -cf - . | apt_repo add "$COMPONENT"
+          echo "$suites" > suites.txt
+      - name: Smoke test
+        run: |
+          curl -fsS -o /dev/null "$APT_URL/tileception.gpg"
+          for suite in $(cat suites.txt); do
+            for arch in amd64 arm64; do
+              curl -fsS "$APT_URL/dists/$suite/$COMPONENT/binary-$arch/Packages" > Packages
+              file=$(awk -v v="$DEB_VERSION" '
+                $1 == "Package:" { name = $2 }
+                $1 == "Version:" { hit = (name == "sanitty" && $2 == v) }
+                hit && $1 == "Filename:" { print $2; exit }' Packages)
+              [[ -n "$file" ]] || { echo "$suite/$arch does not list sanitty $DEB_VERSION" >&2; exit 1; }
+              curl -fsSL -o /dev/null --head "$APT_URL/$file" \
+                || { echo "$APT_URL/$file does not download" >&2; exit 1; }
+            done
+          done
