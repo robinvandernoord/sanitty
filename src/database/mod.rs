@@ -44,9 +44,6 @@ use driver::ResultSet;
 use driver::Schema;
 use grid::Grid;
 
-/// Rows a table opened from the tree shows.
-const TABLE_ROWS: usize = 500;
-
 /// What the app should do after a key or an answer.
 pub enum Outcome {
     Pending,
@@ -872,7 +869,10 @@ impl Database {
         };
         self.focus = Focus::Grid;
         self.execute(Pending {
-            sql: format!("SELECT * FROM {name}{order} LIMIT {TABLE_ROWS}"),
+            sql: format!(
+                "SELECT * FROM {name}{order} LIMIT {}",
+                crate::settings::get().database.table_rows
+            ),
             rerun: false,
             to_popup: false,
         })

@@ -4,8 +4,8 @@ A PyCharm-flavoured terminal IDE built on the published `karet-*` crates. It run
 the office PC over SSH (from Ghostty, sometimes the T3 integrated terminal), so files,
 language servers, git, docker and databases are all local to it.
 
-Status: approved plan; shortcuts are starting defaults. Milestones 1 to 4 are built;
-milestone 4 (Database) awaits its demo.
+Status: approved plan; shortcuts are starting defaults. Milestones 1 to 4 are done;
+milestone 5 (Polish) is built: the settings file and multi-caret editing.
 
 ## Principles
 
@@ -272,6 +272,11 @@ key check (`sanitty --check-keys`, 2026-11-19).
 | Run SQL                  | `Alt+Enter`      |
 | Duplicate line           | `Alt+D`          |
 | Delete line              | `Alt+Y`          |
+| Add caret above / below  | `Alt+Up` / `Alt+Down` |
+| Add next occurrence      | `Alt+A`          |
+| Remove last added caret  | `Alt+U`          |
+| Select all occurrences   | `Ctrl+Alt+J`     |
+| Carets at line ends      | `Ctrl+Alt+G`     |
 | Undo / redo              | `Ctrl+Z` / `Alt+Z` |
 | Copy (quits without selection) / cut / paste | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` |
 | Select all               | `Ctrl+A`         |
@@ -290,9 +295,9 @@ them. Inside the find bar, `Alt+C` / `Alt+W` / `Alt+X` toggle case, words and re
 128 keys arrive in both terminals and are bound to nothing; these are the pool for new
 bindings. Prefer Alt, then Ctrl+Alt.
 
-- Alt: 2, 3, 4, 5, 7, 0, `-`, `=`, Backspace; U, O, P, `[`, `]`, `\`; A, `;`, `'`,
-  X, C, V, M; Up, Down
-- Ctrl+Alt: Q, W, E, R, T, Y, U, I, O, P; S, D, F, G, H, J, K, L; Z, X, C, V, N, M;
+- Alt: 2, 3, 4, 5, 7, 0, `-`, `=`, Backspace; O, P, `[`, `]`, `\`; `;`, `'`,
+  X, C, V, M
+- Ctrl+Alt: Q, W, E, R, T, Y, U, I, O, P; S, D, F, H, K, L; Z, X, C, V, N, M;
   Shift+N; Up, Down, Left, Right
 - F-keys: F4, F5, F7, F9, F10, F11, F12; Shift+F1, F2, F4, F5, F7, F9, F10, F11, F12;
   Ctrl+F1 to F5, F7 to F12; Alt+F1, F2, F3, F5, F6, F8 to F12
@@ -322,8 +327,9 @@ One Rust binary.
   Astral's ty (`ty server`) for types and navigation, with ruff (`ruff server`) alongside
   for lint and format: each server's problems are kept apart and shown merged, and
   Reformat asks the first server that can format (ruff for Python).
-  When ruff is not installed, Python runs on ty alone, silently. ty is still beta, so basedpyright stays a configured fallback and
-  the choice is a setting. Rust uses rust-analyzer. TypeScript/JavaScript use
+  When ruff is not installed, Python runs on ty alone, silently. ty is still beta, so
+  basedpyright stays a fallback, and `settings.toml` can prefer it (or pyright, pylsp) or
+  turn ruff off. Rust uses rust-analyzer. TypeScript/JavaScript use
   TypeScript 7's own server (`tsc --lsp --stdio`, the project's `node_modules` first,
   else the `tsc` on PATH, e.g. from `bun i -g typescript`), with
   typescript-language-server as the fallback for older TypeScript (pointed at a global
@@ -350,12 +356,28 @@ Config lives in `~/.config/sanitty/` (keymap, settings) and per project in
 3. **Review** (done): the Review view with four sources (your changes, this branch vs
    main, commits, a GitHub PR), split and inline diffs in syntax colours, line and range
    comments, viewed marks, Markdown export, state kept between runs.
-4. **Database** (done, awaiting demo): compose discovery, schema tree, query editor,
+4. **Database** (done): compose discovery, schema tree, query editor,
    result grid, confirmed writes and cell edits, `Alt+Enter` from `.sql` files. Tested
    against Postgres (compose-built image), MariaDB and MySQL (published and unpublished
    ports) and SQLite. A read that finds no rows still shows its column headers (the
    server prepares the statement for them), and MySQL's `#` comments are recognised on
    MySQL connections only.
-5. **Polish**: multi-caret, settings file.
+5. **Polish** (built, awaiting demo): multi-caret, settings file.
+   - Multi-caret (built): `Alt+Up`/`Alt+Down` add a caret above/below, `Alt+A` adds the
+     next occurrence of the word under the caret (the first press selects it) or of the
+     selection, `Alt+U` removes the last added caret (walks back caret operations),
+     `Ctrl+Alt+J` selects all occurrences, `Ctrl+Alt+G` puts a caret at the end of each
+     selected line, `Esc` goes back to one. Typing, Backspace/Delete (words too), Enter,
+     Tab, paste, cut, duplicate/delete line and toggle comment work at every caret as one
+     undo step. Copy and cut join several selections with line breaks; a paste with as
+     many lines as carets puts one at each. Completion, rename, hover and jumps use the
+     main caret (the last added) and the other carets stay where they are. The top bar
+     shows `3 carets`. Without the kitty keyboard protocol (tmux, older terminals)
+     Ctrl+Alt+J arrives as Alt+Enter (Run SQL); T3 and Ghostty send it as itself.
+   - Settings file (done): `~/.config/sanitty/settings.toml`, read at start like the
+     keymap; every key optional, mistakes shown in the status line with the default kept.
+     `[editor] tab_size`; `[python] server` (ty, basedpyright, pyright, pylsp: the
+     preferred one first, then the usual order) and `ruff`; `[database] table_rows` and
+     `max_rows`.
 
 Each milestone ends with a short demo for approval before the next one starts.

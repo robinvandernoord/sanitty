@@ -93,6 +93,12 @@ impl App {
             | Action::SelectAll
             | Action::DuplicateLine
             | Action::DeleteLine
+            | Action::AddCaretAbove
+            | Action::AddCaretBelow
+            | Action::AddNextOccurrence
+            | Action::RemoveLastCaret
+            | Action::SelectAllOccurrences
+            | Action::CaretsAtLineEnds
             | Action::ToggleComment
             | Action::Find
             | Action::Replace

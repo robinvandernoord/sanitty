@@ -9,15 +9,18 @@ use std::time::UNIX_EPOCH;
 
 use karet_core::AppliedEdit;
 use karet_core::Change;
+use karet_core::CursorState;
 use karet_core::Diagnostic;
 use karet_core::EditCause;
 use karet_core::Highlights;
 use karet_core::LineCol;
 use karet_core::Range;
+use karet_core::Selection;
 use karet_core::TextEdit;
 use karet_editor::EditorState;
 use karet_editor::editing;
 use karet_editor::editing::Edit;
+use karet_editor::editing::MultiEdit;
 use karet_syntax::LanguageId;
 use karet_syntax::LayeredHighlighter;
 use karet_syntax::LayeredParser;
@@ -216,21 +219,121 @@ impl Doc {
             })
     }
 
-    /// Apply an edit and move the caret where it says.
+    /// Apply an edit and move the caret where it says. Other carets (with
+    /// several) stay, moved along with the text.
     pub fn apply(&mut self, edit: Edit, cause: EditCause) -> bool {
         let Edit { change, caret } = edit;
+        let before = self.state.cursors().clone();
+        let ctx = EditContext {
+            tick_ms: Self::now_ms(),
+            cause,
+            cursor_before: before.clone(),
+        };
+        let Ok(applied) = self.buffer.apply(&change, ctx) else {
+            return false;
+        };
+        if before.selections.len() > 1 {
+            self.keep_others(&before, &change.edits, Selection::caret(caret));
+        } else {
+            self.state.place_caret(caret);
+        }
+        self.state.reveal(&self.buffer, caret);
+        self.rehighlight(&applied.edits);
+        true
+    }
+
+    /// After an edit at the main caret: the main one goes to `primary`, the
+    /// others move with the text the edit changed.
+    fn keep_others(&mut self, before: &CursorState, edits: &[TextEdit], primary: Selection) {
+        let selections = before
+            .selections
+            .iter()
+            .enumerate()
+            .map(|(idx, selection)| {
+                if idx == before.primary {
+                    primary
+                } else {
+                    editing::map_selection(*selection, edits)
+                }
+            })
+            .collect();
+        self.state.set_cursor_state(
+            &self.buffer,
+            CursorState {
+                selections,
+                primary: before.primary,
+            },
+        );
+    }
+
+    /// Whether there is more than one caret.
+    pub fn multi(&self) -> bool {
+        self.state.has_multiple_cursors()
+    }
+
+    /// With several carets: one edit per caret (from `build`, given the
+    /// caret's index, its selection and the buffer version), applied as one
+    /// undo step. A caret whose `build` gives `None` stays where it is.
+    fn edit_each(
+        &mut self,
+        cause: EditCause,
+        build: impl Fn(&Self, usize, Selection, u64) -> Option<Edit>,
+    ) -> bool {
+        let base = self.buffer.version();
+        let cursors = self.state.cursors().clone();
+        let items: Vec<(Selection, Option<Edit>)> = cursors
+            .selections
+            .iter()
+            .enumerate()
+            .map(|(idx, selection)| (*selection, build(self, idx, *selection, base)))
+            .collect();
+        match editing::compose(base, cursors.primary, &items) {
+            Some(multi) => self.apply_multi(multi, cause),
+            None => false,
+        }
+    }
+
+    /// Apply an edit that spans every caret, and take the carets it leaves.
+    fn apply_multi(&mut self, multi: MultiEdit, cause: EditCause) -> bool {
         let ctx = EditContext {
             tick_ms: Self::now_ms(),
             cause,
             cursor_before: self.state.cursors().clone(),
         };
-        let Ok(applied) = self.buffer.apply(&change, ctx) else {
+        let Ok(applied) = self.buffer.apply(&multi.change, ctx) else {
             return false;
         };
-        self.state.place_caret(caret);
-        self.state.reveal(&self.buffer, caret);
+        self.state.set_cursor_state(&self.buffer, multi.cursors);
+        self.state.reveal(&self.buffer, self.caret());
         self.rehighlight(&applied.edits);
         true
+    }
+
+    /// Paste at every caret: with as many lines as carets, one line each;
+    /// otherwise the whole text at each.
+    pub fn paste_each(&mut self, text: &str) {
+        let carets = self.state.cursors().selections.len();
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        let lines: Vec<String> = body.split('\n').map(str::to_string).collect();
+        if lines.len() == carets {
+            self.insert_each(&lines);
+        } else {
+            self.type_text(text);
+        }
+    }
+
+    /// Put `texts[i]` at caret `i` (replacing its selection): a paste with as
+    /// many lines as there are carets.
+    pub fn insert_each(&mut self, texts: &[String]) {
+        self.edit_each(EditCause::Paste, |_, idx, selection, base| {
+            let text = texts.get(idx)?;
+            Some(editing::insert(
+                selection.head,
+                selected(selection),
+                base,
+                text,
+            ))
+        });
     }
 
     /// Apply raw edits (e.g. from an LSP rename) whose columns are already in
@@ -238,15 +341,28 @@ impl Doc {
     pub fn apply_edits(&mut self, edits: Vec<TextEdit>) -> bool {
         let change = Change::new(self.buffer.version(), edits);
         let caret = self.caret();
+        let before = self.state.cursors().clone();
         // Undo puts the caret back where it was before these edits.
         let ctx = EditContext {
             tick_ms: Self::now_ms(),
             cause: EditCause::Replace,
-            cursor_before: self.state.cursors().clone(),
+            cursor_before: before.clone(),
         };
         let Ok(applied) = self.buffer.apply(&change, ctx) else {
             return false;
         };
+        if before.selections.len() > 1 {
+            // Every caret moves with the text (a rename, a reformat).
+            let primary = before
+                .selections
+                .get(before.primary)
+                .map_or(Selection::caret(caret), |selection| {
+                    editing::map_selection(*selection, &change.edits)
+                });
+            self.keep_others(&before, &change.edits, primary);
+            self.rehighlight(&applied.edits);
+            return true;
+        }
         let clamped = self.buffer.clamp(caret);
         self.state.place_caret(clamped);
         self.rehighlight(&applied.edits);
@@ -254,6 +370,22 @@ impl Doc {
     }
 
     pub fn type_text(&mut self, text: &str) {
+        if self.multi() {
+            let cause = if text.chars().count() == 1 {
+                EditCause::Type
+            } else {
+                EditCause::Paste
+            };
+            self.edit_each(cause, |_, _, selection, base| {
+                Some(editing::insert(
+                    selection.head,
+                    selected(selection),
+                    base,
+                    text,
+                ))
+            });
+            return;
+        }
         let base = self.buffer.version();
         let edit = editing::insert(self.caret(), self.selection(), base, text);
         let cause = if text.chars().count() == 1 {
@@ -265,6 +397,17 @@ impl Doc {
     }
 
     pub fn newline(&mut self) {
+        if self.multi() {
+            self.edit_each(EditCause::Newline, |doc, _, selection, base| {
+                Some(editing::newline(
+                    selection.head,
+                    selected(selection),
+                    &doc.buffer,
+                    base,
+                ))
+            });
+            return;
+        }
         let edit = editing::newline(
             self.caret(),
             self.selection(),
@@ -275,6 +418,17 @@ impl Doc {
     }
 
     pub fn backspace(&mut self, word: bool) {
+        if self.multi() {
+            self.edit_each(EditCause::Delete, |doc, _, selection, base| {
+                let (head, range) = (selection.head, selected(selection));
+                if word {
+                    editing::delete_word_backward(head, range, &doc.buffer, base)
+                } else {
+                    editing::backspace(head, range, &doc.buffer, base)
+                }
+            });
+            return;
+        }
         let (caret, selection, version) = (self.caret(), self.selection(), self.buffer.version());
         let edit = if word {
             editing::delete_word_backward(caret, selection, &self.buffer, version)
@@ -287,6 +441,17 @@ impl Doc {
     }
 
     pub fn delete(&mut self, word: bool) {
+        if self.multi() {
+            self.edit_each(EditCause::Delete, |doc, _, selection, base| {
+                let (head, range) = (selection.head, selected(selection));
+                if word {
+                    editing::delete_word_forward(head, range, &doc.buffer, base)
+                } else {
+                    editing::delete_forward(head, range, &doc.buffer, base)
+                }
+            });
+            return;
+        }
         let (caret, selection, version) = (self.caret(), self.selection(), self.buffer.version());
         let edit = if word {
             editing::delete_word_forward(caret, selection, &self.buffer, version)
@@ -305,6 +470,12 @@ impl Doc {
     }
 
     pub fn duplicate_line(&mut self) {
+        if self.multi() {
+            self.edit_each(EditCause::Replace, |doc, _, selection, base| {
+                Some(doc.duplicate_edit(selection, base))
+            });
+            return;
+        }
         if let Some(sel) = self.selection().filter(|range| !range.is_empty()) {
             let text = self.buffer.slice_range(sel).unwrap_or_default();
             let edit = editing::insert(sel.end, None, self.buffer.version(), &text);
@@ -326,6 +497,12 @@ impl Doc {
     }
 
     pub fn delete_line(&mut self) {
+        if self.multi() {
+            self.edit_each(EditCause::Delete, |doc, _, selection, base| {
+                Some(doc.delete_line_edit(selection.head, base))
+            });
+            return;
+        }
         let caret = self.caret();
         let last = to_u32(self.buffer.line_count().saturating_sub(1));
         let range = if caret.line < last {
@@ -368,6 +545,17 @@ impl Doc {
         let Some(prefix) = comment_prefix(&self.path) else {
             return;
         };
+        if self.multi() {
+            if let Some(multi) = editing::toggle_line_comment(
+                &self.buffer,
+                self.state.cursors(),
+                self.buffer.version(),
+                editing::LineComment::Prefix(prefix),
+            ) {
+                self.apply_multi(multi, EditCause::Replace);
+            }
+            return;
+        }
         let caret = self.caret();
         let (first, last) = match self.selection().filter(|range| !range.is_empty()) {
             Some(range) => (
@@ -429,6 +617,49 @@ impl Doc {
         }
     }
 
+    /// Duplicate Line at one caret: a selection is copied after itself, a
+    /// bare caret's line below it (the caret going along).
+    fn duplicate_edit(&self, selection: Selection, base: u64) -> Edit {
+        if let Some(range) = selected(selection) {
+            let text = self.buffer.slice_range(range).unwrap_or_default();
+            return editing::insert(range.end, None, base, &text);
+        }
+        let caret = selection.head;
+        let line = self.buffer.line(caret.line as usize).unwrap_or_default();
+        let text = format!("\n{}", line.trim_end_matches(['\n', '\r']));
+        let mut edit = editing::insert(
+            LineCol::new(caret.line, self.line_len(caret.line)),
+            None,
+            base,
+            &text,
+        );
+        edit.caret = LineCol::new(caret.line + 1, caret.col);
+        edit
+    }
+
+    /// Delete Line at one caret: its line with the break after it (before
+    /// it, on the last line).
+    fn delete_line_edit(&self, caret: LineCol, base: u64) -> Edit {
+        let last = to_u32(self.buffer.line_count().saturating_sub(1));
+        let range = if caret.line < last {
+            Range {
+                start: LineCol::new(caret.line, 0),
+                end: LineCol::new(caret.line + 1, 0),
+            }
+        } else if caret.line > 0 {
+            Range {
+                start: LineCol::new(caret.line - 1, self.line_len(caret.line - 1)),
+                end: LineCol::new(caret.line, self.line_len(caret.line)),
+            }
+        } else {
+            Range {
+                start: LineCol::new(0, 0),
+                end: LineCol::new(0, self.line_len(0)),
+            }
+        };
+        editing::insert(range.start, Some(range), base, "")
+    }
+
     pub fn undo(&mut self) {
         if let Some(applied) = self.buffer.undo() {
             if let Some(cursors) = applied.restored_cursor {
@@ -452,10 +683,15 @@ impl Doc {
         }
     }
 
+    /// The selected text; with several selections, each on its own line.
     pub fn selected_text(&self) -> Option<String> {
-        self.selection()
-            .filter(|range| !range.is_empty())
-            .and_then(|range| self.buffer.slice_range(range))
+        let parts: Vec<String> = self
+            .state
+            .selection_ranges()
+            .into_iter()
+            .filter_map(|range| self.buffer.slice_range(range))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
     }
 
     /// The current line including its break, PyCharm-style copy without selection.
@@ -471,6 +707,38 @@ impl Doc {
     }
 
     pub fn cut(&mut self) -> String {
+        if self.multi() {
+            if let Some(text) = self.selected_text() {
+                // Only the selections go; bare carets stay as they are.
+                self.edit_each(EditCause::Delete, |_, _, selection, base| {
+                    let range = selected(selection)?;
+                    Some(editing::insert(range.start, Some(range), base, ""))
+                });
+                return text;
+            }
+            // No selection: every caret's line, once each.
+            let mut lines: Vec<u32> = self
+                .state
+                .cursors()
+                .selections
+                .iter()
+                .map(|selection| selection.head.line)
+                .collect();
+            lines.dedup();
+            let text: String = lines
+                .iter()
+                .map(|line| {
+                    let text = self.buffer.line(*line as usize).unwrap_or_default();
+                    if text.ends_with('\n') {
+                        text
+                    } else {
+                        format!("{text}\n")
+                    }
+                })
+                .collect();
+            self.delete_line();
+            return text;
+        }
         if let Some(text) = self.selected_text() {
             self.backspace(false);
             text
@@ -587,6 +855,11 @@ fn comment_prefix(path: &Path) -> Option<&'static str> {
     })
 }
 
+/// A selection's range, or `None` for a bare caret.
+fn selected(selection: Selection) -> Option<Range> {
+    (!selection.is_empty()).then(|| selection.range())
+}
+
 fn line_visible(state: &EditorState, line: u32) -> bool {
     let view = state.viewport();
     view.start.line < view.end.line && view.start.line <= line && line < view.end.line
@@ -600,6 +873,65 @@ fn to_u32(count: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Typing, deleting, pasting, commenting and cutting at several carets.
+    #[test]
+    fn edits_at_every_caret() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("sanitty-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("a.py");
+        std::fs::write(&path, "one\ntwo\nthree\n")?;
+        let mut doc = Doc::open(&path)?;
+        doc.goto(LineCol::new(0, 0));
+        doc.state.add_caret_below(&doc.buffer);
+        doc.state.add_caret_below(&doc.buffer);
+        assert!(doc.multi());
+
+        // Typing and Backspace at all three, each one undo step.
+        doc.type_text("x");
+        assert_eq!(doc.buffer.text(), "xone\nxtwo\nxthree\n");
+        doc.backspace(false);
+        assert_eq!(doc.buffer.text(), "one\ntwo\nthree\n");
+        doc.type_text("-");
+        doc.undo();
+        assert_eq!(doc.buffer.text(), "one\ntwo\nthree\n");
+        assert_eq!(doc.state.cursors().selections.len(), 3);
+
+        // As many lines as carets: one each.
+        doc.paste_each("a\nb\nc\n");
+        assert_eq!(doc.buffer.text(), "aone\nbtwo\ncthree\n");
+        // Otherwise the whole text at each.
+        doc.paste_each("#");
+        assert_eq!(doc.buffer.text(), "a#one\nb#two\nc#three\n");
+
+        // Comments toggle on every caret's line.
+        doc.toggle_comment();
+        assert_eq!(doc.buffer.text(), "# a#one\n# b#two\n# c#three\n");
+        doc.toggle_comment();
+
+        // Two selections copy as two lines, and cut takes only them.
+        doc.goto(LineCol::new(0, 0));
+        doc.state.add_next_occurrence(&doc.buffer);
+        doc.state.add_next_occurrence(&doc.buffer);
+        assert_eq!(doc.selected_text().as_deref(), Some("a"));
+        doc.goto(LineCol::new(0, 2));
+        doc.state.add_next_occurrence(&doc.buffer); // selects "one"
+        doc.state.add_caret_below(&doc.buffer);
+        let text = doc.cut();
+        assert_eq!(text, "one");
+        assert_eq!(doc.buffer.text(), "a#\nb#two\nc#three\n");
+
+        // An edit at the main caret leaves the others in place.
+        doc.goto(LineCol::new(1, 0));
+        doc.state.add_caret_below(&doc.buffer);
+        let base = doc.buffer.version();
+        let edit = editing::insert(doc.caret(), None, base, "!");
+        doc.apply(edit, EditCause::Type);
+        assert_eq!(doc.buffer.text(), "a#\nb#two\n!c#three\n");
+        assert_eq!(doc.state.cursors().selections.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     /// Undoing several edits applied as one step (a completion with its
     /// import) puts the caret back where it was.

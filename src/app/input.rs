@@ -54,7 +54,11 @@ impl App {
             }
             Overlay::None => {
                 if let Some(doc) = self.doc() {
-                    doc.type_text(&text);
+                    if doc.multi() {
+                        doc.paste_each(&text);
+                    } else {
+                        doc.type_text(&text);
+                    }
                 }
             }
             _ => {}
@@ -284,7 +288,7 @@ impl App {
         match key.code {
             KeyCode::Esc => doc.state.collapse_to_primary(),
             KeyCode::Enter => doc.newline(),
-            KeyCode::Tab => doc.type_text("    "),
+            KeyCode::Tab => doc.type_text(&" ".repeat(crate::settings::get().editor.tab_size)),
             // Ctrl or Alt: the word before the caret.
             KeyCode::Backspace => doc.backspace(ctrl || alt),
             KeyCode::Delete => doc.delete(ctrl),
@@ -349,6 +353,12 @@ impl App {
             Action::Rename => self.start_rename_overlay(),
             Action::DuplicateLine => self.with_doc(Doc::duplicate_line),
             Action::DeleteLine => self.with_doc(Doc::delete_line),
+            Action::AddCaretAbove
+            | Action::AddCaretBelow
+            | Action::AddNextOccurrence
+            | Action::RemoveLastCaret
+            | Action::SelectAllOccurrences
+            | Action::CaretsAtLineEnds => self.caret_action(action),
             Action::ToggleComment => self.with_doc(Doc::toggle_comment),
             Action::Reformat => self.reformat(),
             Action::Complete => self.start_completion(),
@@ -388,6 +398,32 @@ impl App {
                 }
             }
             Action::Shell => self.request = Some(Request::Shell),
+        }
+    }
+
+    /// Adding and removing carets (multi-caret editing).
+    fn caret_action(&mut self, action: Action) {
+        match action {
+            Action::AddCaretAbove => self.with_doc(|doc| doc.state.add_caret_above(&doc.buffer)),
+            Action::AddCaretBelow => self.with_doc(|doc| doc.state.add_caret_below(&doc.buffer)),
+            Action::AddNextOccurrence => {
+                self.with_doc(|doc| doc.state.add_next_occurrence(&doc.buffer));
+            }
+            Action::RemoveLastCaret => {
+                let undone = self
+                    .doc()
+                    .is_some_and(|doc| doc.state.undo_caret_operation(&doc.buffer));
+                if !undone && self.cur().is_some() {
+                    self.status = "No caret to remove".into();
+                }
+            }
+            Action::SelectAllOccurrences => {
+                self.with_doc(|doc| doc.state.select_all_occurrences(&doc.buffer));
+            }
+            Action::CaretsAtLineEnds => {
+                self.with_doc(|doc| doc.state.add_cursors_to_line_ends(&doc.buffer));
+            }
+            _ => {}
         }
     }
 
@@ -510,6 +546,10 @@ impl App {
     fn paste_clipboard(&mut self) {
         let text = self.clipboard.clone();
         let Some(doc) = self.doc() else { return };
+        if doc.multi() {
+            doc.paste_each(&text);
+            return;
+        }
         let caret = doc.caret();
         // A whole-line copy pastes above the current line, as in PyCharm.
         if text.ends_with('\n') && doc.state.selection_range().is_none_or(Range::is_empty) {

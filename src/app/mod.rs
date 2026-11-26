@@ -157,7 +157,8 @@ pub struct App {
 
 impl App {
     pub fn new(root: PathBuf, tx: UnboundedSender<Event>) -> Self {
-        let (keymap, problems) = Keymap::load();
+        let (keymap, mut problems) = Keymap::load();
+        problems.extend(crate::settings::load());
         let theme = Theme::dark();
         Self {
             root,

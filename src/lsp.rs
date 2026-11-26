@@ -179,7 +179,9 @@ fn server_key(lang: &str) -> &'static str {
 /// Every server for a language: the main one first, then linters.
 fn server_keys(lang: &str) -> &'static [&'static str] {
     match server_key(lang) {
-        "python" => &["python", "ruff"],
+        // ruff alongside unless the settings turn it off.
+        "python" if crate::settings::get().python.ruff => &["python", "ruff"],
+        "python" => &["python"],
         "rust" => &["rust"],
         _ => &["ts"],
     }
@@ -213,15 +215,21 @@ fn spec_for(key: &str, root: &Path) -> Option<LspSpec> {
             langs.iter().map(|lang| (*lang).to_string()).collect(),
         ));
     }
+    // The preferred Python server (ty unless the settings say otherwise),
+    // then the others in the usual order.
+    let python: Vec<(&str, &[&str], &[&str])> = crate::settings::get()
+        .python
+        .server
+        .order()
+        .into_iter()
+        .map(|server| {
+            let (cmd, args) = server.command();
+            (cmd, args, &["python"][..])
+        })
+        .collect();
     let candidates: &[(&str, &[&str], &[&str])] = match key {
         "ruff" => &[("ruff", &["server"], &["python"])],
-        // ty first (Astral, fast, beta); the others are fallbacks.
-        "python" => &[
-            ("ty", &["server"], &["python"]),
-            ("basedpyright-langserver", &["--stdio"], &["python"]),
-            ("pyright-langserver", &["--stdio"], &["python"]),
-            ("pylsp", &[], &["python"]),
-        ],
+        "python" => &python,
         "rust" => &[("rust-analyzer", &[], &["rust"])],
         _ => &[(
             "typescript-language-server",

@@ -12,11 +12,12 @@ sanitty is a non-modal IDE written in Rust that runs entirely in the terminal. J
 - Tree-sitter syntax highlighting (edits reparse only what changed, except in TypeScript), rainbow columns for CSV and TSV, and colour swatches next to colour values in style files.
 - A Review view (`Alt+9`) for your uncommitted changes, this branch against main, one or more commits, or an open GitHub pull request (through `gh`): a side-by-side or inline diff in syntax colours, comments on lines and ranges, viewed marks, and the whole review copied to the clipboard as Markdown. Comments are kept between runs, outside the project.
 - A Database view (`Alt+8`) for PostgreSQL, MySQL/MariaDB and SQLite: connections found in `docker compose` (or set in `.sanitty/db.toml`), a schema tree, a query editor with completion (`Alt+J`) and documentation (`Alt+H`) from the schema, a result grid, and cell edits in any result that includes the table's primary key. Every statement that changes the database is shown and confirmed before it runs. `Alt+Enter` also runs the statement under the caret in any file, with the result in a popup.
+- Multi-caret editing: add carets above and below, at the next or every occurrence of a word, or at the ends of selected lines, then type, delete, paste or comment at all of them as one undo step.
 - Check Keys records which shortcuts reach sanitty.
 
 ## Status
 
-sanitty is an early personal project. The editor, language-server, review and database milestones are complete. Multi-caret editing and a settings file are planned. See [PLAN.md](PLAN.md).
+sanitty is an early personal project. The editor, language-server, review and database milestones are complete, and so are multi-caret editing and a settings file. See [PLAN.md](PLAN.md).
 
 ## Build and run
 
@@ -35,7 +36,7 @@ Language servers are optional and installed separately on the machine running sa
 
 | Language | Server |
 | --- | --- |
-| Python | `ty` (`uv tool install ty`), plus `ruff` (`uv tool install ruff`) for lint warnings and formatting. When `ty` is not installed, sanitty uses the first of `basedpyright-langserver`, `pyright-langserver` and `pylsp` it finds. |
+| Python | `ty` (`uv tool install ty`), plus `ruff` (`uv tool install ruff`) for lint warnings and formatting. When `ty` is not installed, sanitty uses the first of `basedpyright-langserver`, `pyright-langserver` and `pylsp` it finds. `settings.toml` can prefer another server or turn ruff off. |
 | Rust | `rust-analyzer` (`rustup component add rust-analyzer`). |
 | TypeScript and JavaScript | TypeScript 7 or newer: `node_modules/.bin/tsc` in the workspace (`npm install -D typescript@7`), else `tsc` on `PATH`. Older TypeScript works through `typescript-language-server` on `PATH`. |
 
@@ -74,6 +75,11 @@ In Recent Files, `Enter` opens the preselected previous file. Copy Line and Chec
 | | Run SQL | `Alt+Enter` |
 | Edit | Duplicate Line | `Alt+D` |
 | | Delete Line | `Alt+Y` |
+| | Add Caret Above / Below | `Alt+Up` / `Alt+Down` |
+| | Add Next Occurrence | `Alt+A` |
+| | Remove Last Added Caret | `Alt+U` |
+| | Select All Occurrences | `Ctrl+Alt+J` |
+| | Carets at Ends of Selected Lines | `Ctrl+Alt+G` |
 | | Undo | `Ctrl+Z` |
 | | Redo | `Alt+Z` |
 | | Copy | `Ctrl+C` |
@@ -100,6 +106,21 @@ On Linux, sanitty uses `$XDG_CONFIG_HOME/sanitty`, with `~/.config/sanitty` as t
 [bindings]
 "f12" = "goto-definition"
 "alt+b" = "none"
+```
+
+Other settings go in `settings.toml`. Every key is optional; a mistake is shown in the status line and the default is used. Changes apply when sanitty starts.
+
+```toml
+[editor]
+tab_size = 4          # spaces Tab inserts
+
+[python]
+server = "ty"         # ty, basedpyright, pyright or pylsp; if it is missing, the next one installed
+ruff = true           # ruff alongside, for lint warnings and formatting
+
+[database]
+table_rows = 500      # rows when opening a table from the tree
+max_rows = 10000      # rows a result keeps
 ```
 
 The Database view finds PostgreSQL and MySQL/MariaDB services in `docker compose config` by their image or their `POSTGRES_*`, `MYSQL_*` and `MARIADB_*` variables. Override a service or add connections in `.sanitty/db.toml` in the project:

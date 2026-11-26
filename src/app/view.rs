@@ -423,6 +423,13 @@ impl App {
                 if let Some(column) = doc.table_column() {
                     left.push(Span::styled(format!("{column}   "), muted));
                 }
+                let carets = doc.state.cursors().selections.len();
+                if carets > 1 {
+                    left.push(Span::styled(
+                        format!("{carets} carets   "),
+                        style.add_modifier(Modifier::BOLD),
+                    ));
+                }
                 // Files something checks: a language server, or the CSV checker.
                 if doc.lsp_lang.is_some() || doc.table.is_some() {
                     let count_of = |sev| {

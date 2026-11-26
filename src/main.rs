@@ -17,6 +17,7 @@ mod markdown;
 mod picker;
 mod review;
 mod search;
+mod settings;
 mod sig;
 mod stylenav;
 mod styles;

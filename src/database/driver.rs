@@ -28,9 +28,6 @@ use sqlx::sqlite::SqlitePoolOptions;
 use super::conn::Connection;
 use super::conn::Engine;
 
-/// A result keeps at most this many rows; the rest are not fetched.
-pub const MAX_ROWS: usize = 10_000;
-
 /// How long connecting may take before it counts as failed.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -64,7 +61,7 @@ pub struct ResultSet {
     pub rows: Vec<Vec<Option<String>>>,
     /// Rows changed by statements that return none.
     pub affected: u64,
-    /// More rows were there than [`MAX_ROWS`].
+    /// More rows were there than `database.max_rows` (settings).
     pub truncated: bool,
     /// Statements run.
     pub statements: usize,
@@ -358,7 +355,7 @@ where
                         .collect();
                     origins = (0..row.len()).map(|idx| row.origin(idx)).collect();
                 }
-                if rows.len() >= MAX_ROWS {
+                if rows.len() >= crate::settings::get().database.max_rows {
                     truncated = true;
                     continue;
                 }
