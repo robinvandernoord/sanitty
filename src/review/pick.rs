@@ -130,7 +130,8 @@ impl Picker {
                     *selected = 0;
                 }
             }
-            KeyCode::Char(chr) if !ctrl => {
+            // Alt+letter is a shortcut, not typing.
+            KeyCode::Char(chr) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
                 if let Some(query) = query {
                     query.push(chr);
                     *selected = 0;

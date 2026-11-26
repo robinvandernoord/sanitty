@@ -495,11 +495,17 @@ fn have_commit(root: &Path, oid: &str) -> bool {
 /// A new, untracked file as an addition of all its lines.
 fn untracked_diff(root: &Path, path: String) -> FileDiff {
     let full = root.join(&path);
-    let size = std::fs::metadata(&full).map_or(0, |meta| meta.len());
-    let text = if size <= MAX_UNTRACKED_BYTES {
-        std::fs::read(&full).ok()
-    } else {
-        None
+    // A symlink shows where it points, as git does, never what it points
+    // to (which may be outside the repository); only regular files are read.
+    let meta = std::fs::symlink_metadata(&full).ok();
+    let text = match meta {
+        Some(meta) if meta.file_type().is_symlink() => std::fs::read_link(&full)
+            .ok()
+            .map(|target| target.as_os_str().as_encoded_bytes().to_vec()),
+        Some(meta) if meta.is_file() && meta.len() <= MAX_UNTRACKED_BYTES => {
+            std::fs::read(&full).ok()
+        }
+        _ => None,
     };
     let opts = DiffOptions {
         path_hint: Some(path.clone()),
@@ -521,5 +527,48 @@ fn untracked_diff(root: &Path, path: String) -> FileDiff {
             is_binary: true,
             hunks: Vec::new(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An untracked symlink shows where it points, never the contents of
+    /// what it points to (here a file outside the repository).
+    #[test]
+    fn untracked_symlinks_show_their_target_not_its_contents() -> Result<(), String> {
+        let base = std::env::temp_dir().join(format!("sanitty-link-{}", std::process::id()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).map_err(|err| err.to_string())?;
+        let secret = base.join("secret.txt");
+        std::fs::write(&secret, "TOKEN=hunter2\n").map_err(|err| err.to_string())?;
+        let run = |args: &[&str]| git(&repo, args).map(|_| ());
+        run(&["init", "--quiet"])?;
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "start",
+        ])?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, repo.join("link")).map_err(|err| err.to_string())?;
+        let loaded = load(&repo, Source::WorkingTree)?;
+        let shown: String = loaded
+            .files
+            .iter()
+            .flat_map(|file| &file.hunks)
+            .flat_map(|hunk| &hunk.lines)
+            .map(|line| line.content.clone())
+            .collect();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("secret.txt"), "{shown}");
+        Ok(())
     }
 }

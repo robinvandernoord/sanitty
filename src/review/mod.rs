@@ -98,6 +98,12 @@ enum Target {
 pub struct Review {
     root: PathBuf,
     saved: Saved,
+    /// The state as last read from or written to disk, to merge with what
+    /// another sanitty on the same repository wrote since.
+    baseline: Saved,
+    /// Something to say when the view opens (saved state that could not be
+    /// read).
+    message: Option<String>,
     /// The diff on screen, once loaded.
     loaded: Option<Loaded>,
     /// Waiting for a diff or the source list.
@@ -126,14 +132,19 @@ pub struct Review {
     editing: Option<Editing>,
     /// `x` was pressed once; the next `x` clears everything.
     confirm_clear: bool,
+    /// Numbers each request for sources, choices or a diff; an answer for
+    /// an older one (or one whose list was closed meanwhile) is dropped.
+    generation: u64,
 }
 
 impl Review {
     pub fn new(root: PathBuf) -> Self {
-        let saved = state::load(&root);
+        let (saved, message) = state::load(&root);
         Self {
             root,
+            baseline: saved.clone(),
             saved,
+            message,
             loaded: None,
             loading: false,
             error: None,
@@ -151,11 +162,23 @@ impl Review {
             page: 20,
             editing: None,
             confirm_clear: false,
+            generation: 0,
         }
     }
 
     pub fn root(&self) -> &std::path::Path {
         &self.root
+    }
+
+    /// A new request is going out: the number its answer must carry.
+    pub fn request(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    /// Whether an answer is for the latest request.
+    pub fn is_current(&self, generation: u64) -> bool {
+        generation == self.generation
     }
 
     /// What to do when the view opens: load the last source again (it may
@@ -210,9 +233,12 @@ impl Review {
         }
     }
 
-    /// A diff arrived (or failed).
-    pub fn loaded(&mut self, result: Result<Loaded, String>) {
+    /// A diff arrived (or failed). An open comment box closes: its lines
+    /// belong to the diff that was on screen. Says so, if one was open.
+    pub fn loaded(&mut self, result: Result<Loaded, String>) -> Option<String> {
         self.loading = false;
+        let closed = result.is_ok() && self.editing.take().is_some();
+        let mut message = closed.then(|| "A new diff loaded; the comment box closed".to_string());
         match result {
             Ok(mut loaded) => {
                 let same = self
@@ -240,10 +266,13 @@ impl Review {
                     .and_then(|path| self.files().iter().position(|file| file.path == path))
                     .unwrap_or(0);
                 self.reset_rows();
-                self.persist();
+                if let Some(problem) = self.persist() {
+                    message = Some(problem);
+                }
             }
             Err(err) => self.error = Some(err),
         }
+        message
     }
 
     fn files(&self) -> &[FileDiff] {
@@ -267,10 +296,26 @@ impl Review {
             .map_or(&[], |state| state.comments.as_slice())
     }
 
+    /// Something to say once, when the view opens.
+    pub fn take_message(&mut self) -> Option<String> {
+        self.message.take()
+    }
+
+    /// Save, merged with what another instance wrote meanwhile (its comments
+    /// then show here too).
     fn persist(&mut self) -> Option<String> {
-        state::save(&self.root, &self.saved)
-            .err()
-            .map(|err| format!("Could not save the review: {err}"))
+        match state::save(&self.root, &self.saved, &self.baseline) {
+            Ok(written) => {
+                let merged = written != self.saved;
+                self.saved = written.clone();
+                self.baseline = written;
+                if merged {
+                    self.refresh();
+                }
+                None
+            }
+            Err(err) => Some(format!("Could not save the review: {err}")),
+        }
     }
 
     fn reset_rows(&mut self) {
@@ -323,6 +368,14 @@ impl Review {
         if self.editing.is_some() {
             return self.editing_key(key);
         }
+        // The view's keys are plain letters: with Ctrl or Alt held they are
+        // other programs' shortcuts (Alt+D, Ctrl+X), never delete or discard.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Outcome::Pending;
+        }
         let clear = std::mem::take(&mut self.confirm_clear);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
@@ -372,6 +425,9 @@ impl Review {
             Picked::Status(text) => Outcome::Status(text),
             Picked::Close => {
                 self.picker = None;
+                // A list still on its way is no longer wanted.
+                self.generation += 1;
+                self.loading = false;
                 if self.loaded.is_none() {
                     return Outcome::Leave;
                 }
@@ -395,12 +451,13 @@ impl Review {
             return Outcome::Pending;
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Esc => self.editing = None,
             KeyCode::Tab => editing.kind = editing.kind.next(),
             KeyCode::Backspace => crate::picker::erase(&mut editing.text, key),
             KeyCode::Char('u') if ctrl => editing.text.clear(),
-            KeyCode::Char(chr) if !ctrl => editing.text.push(chr),
+            KeyCode::Char(chr) if !ctrl && !alt => editing.text.push(chr),
             KeyCode::Enter => return self.save_comment(),
             _ => {}
         }

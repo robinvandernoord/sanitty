@@ -3,8 +3,6 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::hash::Hash;
-use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -80,7 +78,7 @@ impl Comment {
 }
 
 /// The review of one source.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceState {
     pub comments: Vec<Comment>,
     /// Files marked viewed, with a fingerprint of their diff at the time: a
@@ -89,7 +87,7 @@ pub struct SourceState {
 }
 
 /// Everything kept for one repository.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Saved {
     pub last_source: Option<Source>,
     pub working_tree: SourceState,
@@ -120,17 +118,7 @@ impl Saved {
 /// Where a repository's review is kept: outside the project, under the
 /// user's state directory, named after the repository path.
 pub fn state_file(root: &Path) -> Option<PathBuf> {
-    let dir = dirs::state_dir().or_else(dirs::data_local_dir)?;
-    let name = root.file_name().map_or_else(
-        || "root".to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root.hash(&mut hasher);
-    Some(
-        dir.join("sanitty")
-            .join(format!("review-{name}-{:016x}.json", hasher.finish())),
-    )
+    crate::statefile::path("review", root, ".json")
 }
 
 /// Where the last copied review is also written, next to the state.
@@ -142,35 +130,133 @@ pub fn export_file(root: &Path) -> Option<PathBuf> {
     Some(state.with_extension("md"))
 }
 
-pub fn load(root: &Path) -> Saved {
-    state_file(root)
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
+/// Read the state. A file that is there but does not parse is set aside
+/// (renamed `...broken-<seconds>.json`, so nothing overwrites it) and the
+/// message says where; the review then starts empty.
+pub fn load(root: &Path) -> (Saved, Option<String>) {
+    let Some(path) = state_file(root) else {
+        return (Saved::default(), None);
+    };
+    let Ok(json) = std::fs::read_to_string(&path) else {
+        return (Saved::default(), None);
+    };
+    match serde_json::from_str(&json) {
+        Ok(saved) => (saved, None),
+        Err(err) => {
+            let seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let aside = path.with_extension(format!("broken-{seconds}.json"));
+            let kept = std::fs::rename(&path, &aside).is_ok();
+            let message = if kept {
+                format!(
+                    "The saved review could not be read ({err}); it is kept as {}",
+                    aside.display()
+                )
+            } else {
+                format!("The saved review could not be read ({err})")
+            };
+            (Saved::default(), Some(message))
+        }
+    }
 }
 
-/// Write the state; a failure is reported but loses nothing in memory.
-pub fn save(root: &Path, saved: &Saved) -> Result<(), String> {
+/// Write the state in one step (never half a file). Another sanitty on the
+/// same repository may have written since `baseline` (the state as this one
+/// last read or wrote it): then its changes are kept and this one's go on
+/// top, deletions included. Gives back what was written, which this one
+/// then has too.
+pub fn save(root: &Path, saved: &Saved, baseline: &Saved) -> Result<Saved, String> {
     let path = state_file(root).ok_or("no state directory")?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+    let on_disk: Option<Saved> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok());
+    let merged = match on_disk {
+        Some(disk) if disk != *baseline => merge(&disk, baseline, saved),
+        _ => saved.clone(),
+    };
+    let json = serde_json::to_string_pretty(&merged).map_err(|err| err.to_string())?;
+    crate::statefile::write_atomic(&path, &json).map_err(|err| err.to_string())?;
+    Ok(merged)
+}
+
+/// What another instance wrote (`disk`) with this one's changes since
+/// `base` applied: comments it added or removed, viewed marks it set or
+/// cleared.
+fn merge(disk: &Saved, base: &Saved, ours: &Saved) -> Saved {
+    let mut out = disk.clone();
+    out.last_source.clone_from(&ours.last_source);
+    merge_source(
+        &mut out.working_tree,
+        &base.working_tree,
+        &ours.working_tree,
+    );
+    merge_source(&mut out.branch, &base.branch, &ours.branch);
+    let empty = SourceState::default();
+    let mut keys: Vec<&String> = base.others.keys().chain(ours.others.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        let target = out.others.entry(key.clone()).or_default();
+        merge_source(
+            target,
+            base.others.get(key).unwrap_or(&empty),
+            ours.others.get(key).unwrap_or(&empty),
+        );
     }
-    let json = serde_json::to_string_pretty(saved).map_err(|err| err.to_string())?;
-    std::fs::write(&path, json).map_err(|err| err.to_string())
+    out.others
+        .retain(|_, state| *state != SourceState::default());
+    out
+}
+
+fn merge_source(out: &mut SourceState, base: &SourceState, ours: &SourceState) {
+    for gone in base
+        .comments
+        .iter()
+        .filter(|comment| !ours.comments.contains(comment))
+    {
+        if let Some(pos) = out.comments.iter().position(|comment| comment == gone) {
+            out.comments.remove(pos);
+        }
+    }
+    for added in ours
+        .comments
+        .iter()
+        .filter(|comment| !base.comments.contains(comment))
+    {
+        if !out.comments.contains(added) {
+            out.comments.push(added.clone());
+        }
+    }
+    for (path, print) in &ours.viewed {
+        if base.viewed.get(path) != Some(print) {
+            out.viewed.insert(path.clone(), *print);
+        }
+    }
+    for path in base
+        .viewed
+        .keys()
+        .filter(|path| !ours.viewed.contains_key(*path))
+    {
+        out.viewed.remove(path);
+    }
 }
 
 /// A fingerprint of a file's diff, so a viewed mark lapses when it changes.
+/// The same in every build (see [`crate::statefile::StableHash`]).
 pub fn fingerprint(file: &FileDiff) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    file.path.hash(&mut hasher);
+    let mut hash = crate::statefile::StableHash::new().add(file.path.as_bytes());
     for hunk in &file.hunks {
         for line in &hunk.lines {
-            line.content.hash(&mut hasher);
-            matches!(line.kind, LineKind::Add).hash(&mut hasher);
-            matches!(line.kind, LineKind::Remove).hash(&mut hasher);
+            let kind: &[u8] = match line.kind {
+                LineKind::Add => b"+",
+                LineKind::Remove => b"-",
+                LineKind::Context => b" ",
+            };
+            hash = hash.add(kind).add(line.content.as_bytes());
         }
     }
-    hasher.finish()
+    hash.finish()
 }
 
 /// The line number of `line` on `side`, if it is on that side.
@@ -294,6 +380,44 @@ pub fn export(detail: &str, files: &[FileDiff], comments: &[Comment]) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn note(body: &str) -> Comment {
+        Comment {
+            path: "a.rs".into(),
+            side: Side::New,
+            start: 1,
+            end: 1,
+            anchor: "fn main() {".into(),
+            kind: Kind::Note,
+            body: body.into(),
+        }
+    }
+
+    /// Two sanitty instances on one repository: neither loses the other's
+    /// comments, and a deletion stays deleted.
+    #[test]
+    fn saving_merges_with_what_another_instance_wrote() {
+        let mut base = Saved::default();
+        base.working_tree.comments.push(note("old"));
+        base.working_tree.viewed.insert("a.rs".into(), 7);
+        // The other instance added B and saved.
+        let mut disk = base.clone();
+        disk.working_tree.comments.push(note("B"));
+        // This one added A, deleted "old" and cleared the viewed mark.
+        let mut ours = base.clone();
+        ours.working_tree.comments.retain(|kept| kept.body != "old");
+        ours.working_tree.comments.push(note("A"));
+        ours.working_tree.viewed.clear();
+        let merged = merge(&disk, &base, &ours);
+        let bodies: Vec<&str> = merged
+            .working_tree
+            .comments
+            .iter()
+            .map(|kept| kept.body.as_str())
+            .collect();
+        assert_eq!(bodies, ["B", "A"]);
+        assert!(merged.working_tree.viewed.is_empty());
+    }
 
     const RAW: &str = "diff --git a/shop.py b/shop.py
 --- a/shop.py

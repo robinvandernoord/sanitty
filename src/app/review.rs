@@ -25,8 +25,12 @@ impl App {
         self.screen = Screen::Review;
         let root = self.root.clone();
         let review = self.review.get_or_insert_with(|| Review::new(root));
+        let message = review.take_message();
         let outcome = review.open();
         self.review_outcome(outcome);
+        if let Some(message) = message {
+            self.status = message;
+        }
     }
 
     /// Keys while the Review view is on screen. True when it used the key.
@@ -49,6 +53,29 @@ impl App {
         let outcome = review.handle_key(key);
         self.review_outcome(outcome);
         true
+    }
+
+    /// Answers from git for the view. One for an older request (another
+    /// source picked since, or its list closed) is dropped.
+    pub(super) fn review_event(&mut self, event: Event) {
+        let Some(review) = &mut self.review else {
+            return;
+        };
+        match event {
+            Event::ReviewSources(generation, sources) if review.is_current(generation) => {
+                review.pick(sources);
+            }
+            Event::ReviewChoices(generation, result) if review.is_current(generation) => {
+                let outcome = review.choices(result);
+                self.review_outcome(outcome);
+            }
+            Event::ReviewLoaded(generation, result) if review.is_current(generation) => {
+                if let Some(message) = review.loaded(result) {
+                    self.status = message;
+                }
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn review_outcome(&mut self, outcome: Outcome) {
@@ -75,24 +102,27 @@ impl App {
             Outcome::Leave => self.screen = Screen::Code,
             Outcome::Load(source) => {
                 let tx = self.tx.clone();
+                let generation = self.review.as_mut().map_or(0, Review::request);
                 tokio::task::spawn_blocking(move || {
-                    let _ = tx.send(Event::ReviewLoaded(git::load(&root, source)));
+                    let _ = tx.send(Event::ReviewLoaded(generation, git::load(&root, source)));
                 });
             }
             Outcome::Fetch(entry) => {
                 let tx = self.tx.clone();
+                let generation = self.review.as_mut().map_or(0, Review::request);
                 tokio::task::spawn_blocking(move || {
                     let list = match entry {
                         git::Entry::Prs => git::prs(&root),
                         _ => git::commits(&root),
                     };
-                    let _ = tx.send(Event::ReviewChoices(list));
+                    let _ = tx.send(Event::ReviewChoices(generation, list));
                 });
             }
             Outcome::Sources => {
                 let tx = self.tx.clone();
+                let generation = self.review.as_mut().map_or(0, Review::request);
                 tokio::task::spawn_blocking(move || {
-                    let _ = tx.send(Event::ReviewSources(git::sources(&root)));
+                    let _ = tx.send(Event::ReviewSources(generation, git::sources(&root)));
                 });
             }
         }
