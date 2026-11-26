@@ -12,8 +12,8 @@ milestone 5 (Polish) is built: the settings file and multi-caret editing.
 - One full-screen view at a time. Everything else (file finder, project tree, usages,
   actions) is a popup that disappears when you are done with it.
 - Not modal. One key per action, built on Alt: T3's terminal claims many Ctrl keys and
-  may claim more, so only the universal Ctrl keys (copy, cut, paste, undo, save, select
-  all, find) and PyCharm's F-keys remain. Every default arrives in both T3 and Ghostty.
+  may claim more, so only the universal Ctrl keys (copy, cut, paste, undo and redo
+  (Ctrl+Shift+Z, next to undo), save, select all, find) and PyCharm's F-keys remain. Every default arrives in both T3 and Ghostty.
 - Keyboard only. Mouse capture stays off so the terminal keeps normal text selection.
 - Everything is rebindable in `~/.config/sanitty/keymap.toml`.
 
@@ -277,7 +277,7 @@ key check (`sanitty --check-keys`, 2026-11-19).
 | Remove last added caret  | `Alt+U`          |
 | Select all occurrences   | `Ctrl+Alt+J`     |
 | Carets at line ends      | `Ctrl+Alt+G`     |
-| Undo / redo              | `Ctrl+Z` / `Alt+Z` |
+| Undo / redo              | `Ctrl+Z` / `Ctrl+Shift+Z` |
 | Copy (quits without selection) / cut / paste | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` |
 | Select all               | `Ctrl+A`         |
 | Save                     | `Ctrl+S`         |
@@ -296,7 +296,7 @@ them. Inside the find bar, `Alt+C` / `Alt+W` / `Alt+X` toggle case, words and re
 bindings. Prefer Alt, then Ctrl+Alt.
 
 - Alt: 2, 3, 4, 5, 7, 0, `-`, `=`, Backspace; O, P, `[`, `]`, `\`; `;`, `'`,
-  X, C, V, M
+  Z, X, C, V, M
 - Ctrl+Alt: Q, W, E, R, T, Y, U, I, O, P; S, D, F, H, K, L; Z, X, C, V, N, M;
   Shift+N; Up, Down, Left, Right
 - F-keys: F4, F5, F7, F9, F10, F11, F12; Shift+F1, F2, F4, F5, F7, F9, F10, F11, F12;
@@ -304,7 +304,7 @@ bindings. Prefer Alt, then Ctrl+Alt.
 - Ctrl (avoid, see above): E, R, T, Y, U, O, P, `]`, `\`, D, G, K, L, `;`, `'`, `.`, `/`,
   PageUp, PageDown, Up, Down
 - Ctrl+Shift (last resort: older terminals fold it into Ctrl+letter): R, Y, S, G, H, K,
-  L, Z, X, B, M
+  L, X, B, M
 - Shift: Tab, Enter, Delete
 
 Ctrl+I, Ctrl+M, Ctrl+H and Ctrl+[ also arrived in both, but only because both speak the

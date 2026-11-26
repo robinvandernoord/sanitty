@@ -81,7 +81,7 @@ In Recent Files, `Enter` opens the preselected previous file. Copy Line and Chec
 | | Select All Occurrences | `Ctrl+Alt+J` |
 | | Carets at Ends of Selected Lines | `Ctrl+Alt+G` |
 | | Undo | `Ctrl+Z` |
-| | Redo | `Alt+Z` |
+| | Redo | `Ctrl+Shift+Z` |
 | | Copy | `Ctrl+C` |
 | | Cut | `Ctrl+X` |
 | | Paste (from sanitty's clipboard) | `Ctrl+V` |

@@ -2,7 +2,7 @@
 //!
 //! One default key per action, built on Alt: T3's terminal claims many Ctrl
 //! keys and may claim more. Only the universal Ctrl keys (copy, cut, paste,
-//! undo, save, select all, find) and `PyCharm`'s F-keys remain. Every default
+//! undo and redo, save, select all, find) and `PyCharm`'s F-keys remain. Every default
 //! arrived in both T3 and Ghostty in the key check (`sanitty --check-keys`).
 //!
 //! Users override bindings in `$XDG_CONFIG_HOME/sanitty/keymap.toml`:
@@ -386,7 +386,9 @@ pub const DEFAULTS: &[(&str, Action)] = &[
     ("ctrl+alt+j", Action::SelectAllOccurrences),
     ("ctrl+alt+g", Action::CaretsAtLineEnds),
     ("ctrl+z", Action::Undo),
-    ("alt+z", Action::Redo),
+    // Next to undo (Ctrl+Z), as everywhere; in terminals without the kitty
+    // keyboard protocol it arrives as Ctrl+Z.
+    ("ctrl+shift+z", Action::Redo),
     ("ctrl+c", Action::Copy),
     ("ctrl+x", Action::Cut),
     ("ctrl+v", Action::Paste),
