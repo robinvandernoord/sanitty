@@ -328,7 +328,7 @@ impl Database {
         if sql.trim().is_empty() {
             return Outcome::Status("No SQL under the caret".into());
         }
-        if sql::reads_only(&sql) {
+        if sql::reads_only(self.engine_or_default(), &sql) {
             self.execute(Pending {
                 sql,
                 rerun: false,
@@ -411,7 +411,7 @@ impl Database {
                 return Outcome::Pending;
             }
         };
-        let changes_schema = !sql::reads_only(&pending.sql)
+        let changes_schema = !sql::reads_only(self.engine_or_default(), &pending.sql)
             && ["create", "alter", "drop", "rename"].iter().any(|word| {
                 pending
                     .sql
@@ -593,7 +593,13 @@ impl Database {
         }
     }
 
-    fn engine(&self) -> Option<conn::Engine> {
+    /// The current connection's engine, for reading SQL (Postgres's rules
+    /// before connecting).
+    fn engine_or_default(&self) -> conn::Engine {
+        self.engine().unwrap_or(conn::Engine::Postgres)
+    }
+
+    pub fn engine(&self) -> Option<conn::Engine> {
         self.current
             .and_then(|idx| self.connections.get(idx))
             .map(|conn| conn.engine)
@@ -1452,6 +1458,29 @@ mod tests {
                                     println!("  origins {:?}", result.origins);
                                 }
                                 Err(err) => println!("  {err}"),
+                            }
+                            if conn.engine == conn::Engine::MySql {
+                                // `#` hides the rest of the line: still a read.
+                                let sql = format!("select * from {name} # x; delete from {name}");
+                                println!(
+                                    "  reads only: {}, {:?}",
+                                    sql::reads_only(conn.engine, &sql),
+                                    driver::run(&pool, &sql).await.map(|found| found.rows.len())
+                                );
+                            }
+                            for sql in [
+                                format!("select * from {name} where 1 = 0"),
+                                format!("explain select * from {name}"),
+                            ] {
+                                match driver::run(&pool, &sql).await {
+                                    Ok(result) => println!(
+                                        "  {sql}: {} rows, columns {:?}, first origin {:?}",
+                                        result.rows.len(),
+                                        result.columns,
+                                        result.origins.first()
+                                    ),
+                                    Err(err) => println!("  {sql}: {err}"),
+                                }
                             }
                         }
                     }

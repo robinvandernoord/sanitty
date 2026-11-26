@@ -83,13 +83,14 @@ enum Token {
 }
 
 /// The statement's tokens, strings and comments left out.
-fn tokens(sql: &str) -> Vec<Token> {
+fn tokens(engine: Engine, sql: &str) -> Vec<Token> {
     let chars: Vec<char> = sql.chars().collect();
     let mut out = Vec::new();
     let mut idx = 0;
     while let Some(&chr) = chars.get(idx) {
         match chr {
             '\'' => idx = skip_until(&chars, idx + 1, '\''),
+            '#' if engine == Engine::MySql => idx = skip_until(&chars, idx, '\n'),
             '"' | '`' => {
                 let end = skip_until(&chars, idx + 1, chr);
                 let name: String = chars
@@ -193,8 +194,8 @@ fn is_keyword(word: &str) -> bool {
 
 /// The tables a statement uses, with the alias each goes by (the table's
 /// own name when it has none): (alias, table).
-fn table_refs<'a>(schema: &'a Schema, sql: &str) -> Vec<(String, &'a Table)> {
-    let tokens = tokens(sql);
+fn table_refs<'a>(schema: &'a Schema, engine: Engine, sql: &str) -> Vec<(String, &'a Table)> {
+    let tokens = tokens(engine, sql);
     let mut out = Vec::new();
     let mut idx = 0;
     while let Some(token) = tokens.get(idx) {
@@ -286,10 +287,10 @@ pub fn completions(
     text: &str,
     caret: usize,
 ) -> Vec<CompletionItem> {
-    let statement = super::sql::statement_at(text, caret)
+    let statement = super::sql::statement_at(engine, text, caret)
         .and_then(|range| text.get(range))
         .unwrap_or("");
-    let refs = table_refs(schema, statement);
+    let refs = table_refs(schema, engine, statement);
     let (qualifier, _) = word_before(text.get(..caret).unwrap_or(""));
     let mut items = Vec::new();
     if let Some(qualifier) = qualifier {
@@ -460,7 +461,12 @@ fn column_notes(column: &super::driver::Column) -> String {
 /// What the name under the caret is: a table (its columns) or a column (its
 /// type), as Markdown for the documentation popup, and one line for the
 /// status bar.
-pub fn describe(schema: &Schema, text: &str, caret: usize) -> Option<(String, String)> {
+pub fn describe(
+    schema: &Schema,
+    engine: Engine,
+    text: &str,
+    caret: usize,
+) -> Option<(String, String)> {
     let after: String = text
         .get(caret..)
         .unwrap_or("")
@@ -473,10 +479,10 @@ pub fn describe(schema: &Schema, text: &str, caret: usize) -> Option<(String, St
     if word.is_empty() {
         return None;
     }
-    let statement = super::sql::statement_at(text, caret)
+    let statement = super::sql::statement_at(engine, text, caret)
         .and_then(|range| text.get(range))
         .unwrap_or("");
-    let refs = table_refs(schema, statement);
+    let refs = table_refs(schema, engine, statement);
     let alias_table = |name: &str| {
         refs.iter()
             .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
@@ -561,6 +567,7 @@ mod tests {
         let schema = schema();
         let refs = table_refs(
             &schema,
+            Engine::Postgres,
             "select * from auth_user u, public.shop_order as o join auth_user on o.user_id = 1",
         );
         let found: Vec<(&str, &str)> = refs
@@ -612,13 +619,13 @@ mod tests {
     fn describes_the_name_under_the_caret() {
         let schema = schema();
         let text = "select u.email from auth_user u";
-        let column = describe(&schema, text, 10).map(|(_, line)| line);
+        let column = describe(&schema, Engine::Postgres, text, 10).map(|(_, line)| line);
         assert_eq!(column.as_deref(), Some("auth_user.email: text"));
-        let table = describe(&schema, text, 22).map(|(_, line)| line);
+        let table = describe(&schema, Engine::Postgres, text, 22).map(|(_, line)| line);
         assert_eq!(
             table.as_deref(),
             Some("public.auth_user: table with 2 columns")
         );
-        assert_eq!(describe(&schema, text, 6), None);
+        assert_eq!(describe(&schema, Engine::Postgres, text, 6), None);
     }
 }

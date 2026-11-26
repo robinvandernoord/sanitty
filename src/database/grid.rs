@@ -225,6 +225,7 @@ pub fn summary(result: &ResultSet) -> String {
         return format!("{changed}, {time}");
     }
     let rows = match result.rows.len() {
+        0 => "No rows".to_string(),
         1 => "1 row".to_string(),
         count if result.truncated => format!("first {count} rows"),
         count => format!("{count} rows"),

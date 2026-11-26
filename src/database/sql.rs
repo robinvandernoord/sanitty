@@ -1,7 +1,8 @@
 //! Small SQL text helpers: splitting statements, telling reads from writes,
 //! quoting names and values. No parser: just enough lexing to step over
-//! strings, quoted names, comments and Postgres dollar quoting. MySQL's `#`
-//! comments are not recognised: in Postgres `#` is an operator.
+//! strings, quoted names, comments, Postgres dollar quoting and MySQL's `#`
+//! comments. Each takes the engine: in Postgres `#` is an operator, and only
+//! Postgres has dollar quoting.
 
 use std::ops::Range;
 
@@ -9,34 +10,49 @@ use super::conn::Engine;
 
 /// The statements in `text` as byte ranges, trimmed, without their `;`.
 /// Statements that are only whitespace and comments are left out.
-pub fn split(text: &str) -> Vec<Range<usize>> {
+pub fn split(engine: Engine, text: &str) -> Vec<Range<usize>> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut start = 0;
     let mut idx = 0;
     while let Some(&byte) = bytes.get(idx) {
+        if let Some(next) = skip(engine, text, idx) {
+            idx = next;
+            continue;
+        }
         idx = match byte {
-            b'\'' | b'"' | b'`' => skip_quoted(bytes, idx, byte),
-            b'-' if bytes.get(idx + 1) == Some(&b'-') => skip_line(bytes, idx),
-            b'/' if bytes.get(idx + 1) == Some(&b'*') => skip_block(bytes, idx),
-            b'$' => skip_dollar(text, idx),
             b';' => {
-                push_trimmed(text, start..idx, &mut out);
+                push_trimmed(engine, text, start..idx, &mut out);
                 start = idx + 1;
                 idx + 1
             }
             _ => idx + 1,
         };
     }
-    push_trimmed(text, start..text.len(), &mut out);
+    push_trimmed(engine, text, start..text.len(), &mut out);
     out
+}
+
+/// Past a string, quoted name, comment or dollar-quoted body starting at
+/// `idx`; `None` when nothing like that starts there.
+fn skip(engine: Engine, text: &str, idx: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let next = bytes.get(idx + 1);
+    Some(match *bytes.get(idx)? {
+        quote @ (b'\'' | b'"' | b'`') => skip_quoted(bytes, idx, quote),
+        b'-' if next == Some(&b'-') => skip_line(bytes, idx),
+        b'#' if engine == Engine::MySql => skip_line(bytes, idx),
+        b'/' if next == Some(&b'*') => skip_block(bytes, idx),
+        b'$' if engine == Engine::Postgres => skip_dollar(text, idx),
+        _ => return None,
+    })
 }
 
 /// The statement the caret (a byte offset) is in or right after, as the
 /// caret's own line would suggest: a caret after a statement's `;` on the
 /// same line still means that statement.
-pub fn statement_at(text: &str, caret: usize) -> Option<Range<usize>> {
-    let statements = split(text);
+pub fn statement_at(engine: Engine, text: &str, caret: usize) -> Option<Range<usize>> {
+    let statements = split(engine, text);
     if let Some(found) = statements
         .iter()
         .find(|range| range.start <= caret && caret <= range.end)
@@ -60,51 +76,51 @@ pub fn statement_at(text: &str, caret: usize) -> Option<Range<usize>> {
 
 /// Whether every statement in `sql` only reads. Anything unknown counts as
 /// a write, so it is shown and confirmed before it runs.
-pub fn reads_only(sql: &str) -> bool {
-    let statements = split(sql);
+pub fn reads_only(engine: Engine, sql: &str) -> bool {
+    let statements = split(engine, sql);
     !statements.is_empty()
-        && statements.iter().all(|range| {
-            let words = words(sql.get(range.clone()).unwrap_or(""));
-            let first = words.first().map_or("", String::as_str);
-            match first {
-                "select" | "show" | "describe" | "desc" | "values" | "table" => {
-                    !words.iter().any(|word| word == "into")
-                        && !words.iter().any(|word| word == "for")
-                }
-                "explain" => !words
-                    .iter()
-                    .any(|word| word == "analyze" || word == "analyse"),
-                "with" => !words.iter().any(|word| {
-                    matches!(
-                        word.as_str(),
-                        "insert" | "update" | "delete" | "merge" | "into"
-                    )
-                }),
-                "pragma" => !sql.get(range.clone()).unwrap_or("").contains('='),
-                _ => false,
-            }
-        })
+        && statements
+            .iter()
+            .all(|range| reads(engine, sql.get(range.clone()).unwrap_or("")))
+}
+
+/// Whether one statement only reads.
+pub fn reads(engine: Engine, statement: &str) -> bool {
+    let words = words(engine, statement);
+    match words.first().map_or("", String::as_str) {
+        "select" | "show" | "describe" | "desc" | "values" | "table" => {
+            !words.iter().any(|word| word == "into" || word == "for")
+        }
+        "explain" => !words
+            .iter()
+            .any(|word| word == "analyze" || word == "analyse"),
+        "with" => !words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "insert" | "update" | "delete" | "merge" | "into"
+            )
+        }),
+        "pragma" => !statement.contains('='),
+        _ => false,
+    }
 }
 
 /// The lower-cased words of a statement, outside strings, quoted names and
 /// comments.
-fn words(sql: &str) -> Vec<String> {
+fn words(engine: Engine, sql: &str) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut idx = 0;
     let mut word = String::new();
     while let Some(&byte) = bytes.get(idx) {
-        let next = match byte {
-            b'\'' | b'"' | b'`' => skip_quoted(bytes, idx, byte),
-            b'-' if bytes.get(idx + 1) == Some(&b'-') => skip_line(bytes, idx),
-            b'/' if bytes.get(idx + 1) == Some(&b'*') => skip_block(bytes, idx),
-            b'$' => skip_dollar(sql, idx),
-            _ if byte.is_ascii_alphanumeric() || byte == b'_' => {
+        let next = match skip(engine, sql, idx) {
+            Some(next) => next,
+            None if byte.is_ascii_alphanumeric() || byte == b'_' => {
                 word.push(char::from(byte.to_ascii_lowercase()));
                 idx += 1;
                 continue;
             }
-            _ => idx + 1,
+            None => idx + 1,
         };
         if !word.is_empty() {
             out.push(std::mem::take(&mut word));
@@ -117,11 +133,11 @@ fn words(sql: &str) -> Vec<String> {
     out
 }
 
-fn push_trimmed(text: &str, range: Range<usize>, out: &mut Vec<Range<usize>>) {
+fn push_trimmed(engine: Engine, text: &str, range: Range<usize>, out: &mut Vec<Range<usize>>) {
     let Some(part) = text.get(range.clone()) else {
         return;
     };
-    if words(part).is_empty() {
+    if words(engine, part).is_empty() {
         return;
     }
     let lead = part.len() - part.trim_start().len();
@@ -248,7 +264,7 @@ mod tests {
     use super::*;
 
     fn parts(text: &str) -> Vec<&str> {
-        split(text)
+        split(Engine::Postgres, text)
             .into_iter()
             .filter_map(|range| text.get(range))
             .collect()
@@ -272,34 +288,66 @@ mod tests {
     }
 
     #[test]
+    fn hash_comments_only_in_mysql() {
+        let text = "select 1 # one; two\nfrom dual; select '{}'::jsonb #> '{a}'";
+        let mysql: Vec<&str> = split(Engine::MySql, text)
+            .into_iter()
+            .filter_map(|range| text.get(range))
+            .collect();
+        assert_eq!(
+            mysql,
+            [
+                "select 1 # one; two\nfrom dual",
+                "select '{}'::jsonb #> '{a}'"
+            ]
+        );
+        // In Postgres `#` is an operator: the `;` after it splits.
+        assert_eq!(split(Engine::Postgres, text).len(), 3);
+        // MySQL: the comment hides the delete. Postgres: it is a statement.
+        assert!(reads_only(Engine::MySql, "select 1 # 2; delete from t"));
+        assert!(!reads_only(Engine::Postgres, "select 1 # 2; delete from t"));
+    }
+
+    #[test]
     fn finds_the_statement_under_the_caret() {
         let text = "select 1;\nselect 2; \n\nselect 3";
-        let stmt_at = |caret| statement_at(text, caret).and_then(|range| text.get(range));
+        let stmt_at =
+            |caret| statement_at(Engine::Postgres, text, caret).and_then(|range| text.get(range));
         assert_eq!(stmt_at(0), Some("select 1"));
         assert_eq!(stmt_at(9), Some("select 1"));
         assert_eq!(stmt_at(20), Some("select 2"));
         // On the empty line: the next statement.
         assert_eq!(stmt_at(21), Some("select 3"));
         assert_eq!(stmt_at(text.len()), Some("select 3"));
-        assert_eq!(statement_at("  ", 1), None);
+        assert_eq!(statement_at(Engine::Postgres, "  ", 1), None);
     }
 
     #[test]
     fn tells_reads_from_writes() {
-        assert!(reads_only("select * from t; show tables"));
-        assert!(reads_only("with x as (select 1) select * from x"));
-        assert!(reads_only("explain select 1"));
-        assert!(reads_only("select 'delete' from t"));
-        assert!(!reads_only("select * into backup from t"));
-        assert!(!reads_only("select * from t for update"));
-        assert!(!reads_only("explain analyze delete from t"));
+        assert!(reads_only(Engine::Postgres, "select * from t; show tables"));
+        assert!(reads_only(
+            Engine::Postgres,
+            "with x as (select 1) select * from x"
+        ));
+        assert!(reads_only(Engine::Postgres, "explain select 1"));
+        assert!(reads_only(Engine::Postgres, "select 'delete' from t"));
+        assert!(!reads_only(Engine::Postgres, "select * into backup from t"));
+        assert!(!reads_only(Engine::Postgres, "select * from t for update"));
         assert!(!reads_only(
+            Engine::Postgres,
+            "explain analyze delete from t"
+        ));
+        assert!(!reads_only(
+            Engine::Postgres,
             "with gone as (delete from t returning *) select * from gone"
         ));
-        assert!(!reads_only("select 1; update t set a = 1"));
-        assert!(!reads_only("pragma journal_mode = wal"));
-        assert!(!reads_only("vacuum"));
-        assert!(!reads_only(""));
+        assert!(!reads_only(
+            Engine::Postgres,
+            "select 1; update t set a = 1"
+        ));
+        assert!(!reads_only(Engine::Postgres, "pragma journal_mode = wal"));
+        assert!(!reads_only(Engine::Postgres, "vacuum"));
+        assert!(!reads_only(Engine::Postgres, ""));
     }
 
     #[test]

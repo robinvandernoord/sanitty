@@ -142,7 +142,9 @@ here.
 
 - Engines: PostgreSQL, MySQL/MariaDB, SQLite (one driver layer, `sqlx`). SQL runs over
   each server's text protocol, so several statements run at once and every value shows
-  as text (NULL dimmed, bytes as `\x..` hex). A result keeps at most 10,000 rows.
+  as text (NULL dimmed, bytes as `\x..` hex). A result keeps at most 10,000 rows. The
+  grid shows the last statement's result; when that is a read that found nothing, its
+  column headers come from preparing it (no extra run).
 - Connections: discovered from `docker compose config`: a service counts by its image
   (postgres, postgis, timescaledb, pgvector, mysql, mariadb, percona) or, for images built
   locally, by the server's own `POSTGRES_*` / `MYSQL_*` / `MARIADB_*` variables (clients
@@ -351,8 +353,9 @@ Config lives in `~/.config/sanitty/` (keymap, settings) and per project in
 4. **Database** (done, awaiting demo): compose discovery, schema tree, query editor,
    result grid, confirmed writes and cell edits, `Alt+Enter` from `.sql` files. Tested
    against Postgres (compose-built image), MariaDB and MySQL (published and unpublished
-   ports) and SQLite. Not yet: MySQL `#` comments when splitting statements, column
-   headers for a query that returns no rows.
+   ports) and SQLite. A read that finds no rows still shows its column headers (the
+   server prepares the statement for them), and MySQL's `#` comments are recognised on
+   MySQL connections only.
 5. **Polish**: multi-caret, settings file.
 
 Each milestone ends with a short demo for approval before the next one starts.

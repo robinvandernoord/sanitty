@@ -254,7 +254,12 @@ impl App {
         }
         let text = doc.buffer.text();
         let caret = doc.buffer.line_col_to_byte(doc.caret()).ok()?.0;
-        let range = crate::database::sql::statement_at(&text, caret)?;
+        let engine = self
+            .database
+            .as_ref()
+            .and_then(Database::engine)
+            .unwrap_or(crate::database::conn::Engine::Postgres);
+        let range = crate::database::sql::statement_at(engine, &text, caret)?;
         text.get(range).map(str::to_string)
     }
 
@@ -480,7 +485,7 @@ impl App {
             return false;
         }
         let Some(doc) = self.cur() else { return false };
-        let Some((schema, _)) = self.database.as_ref().and_then(Database::schema_info) else {
+        let Some((schema, engine)) = self.database.as_ref().and_then(Database::schema_info) else {
             if popup {
                 self.status = format!(
                     "SQL documentation comes from a database's schema: {} connects",
@@ -493,7 +498,7 @@ impl App {
         let Ok(caret) = doc.buffer.line_col_to_byte(doc.caret()) else {
             return true;
         };
-        let found = crate::database::assist::describe(schema, &text, caret.0);
+        let found = crate::database::assist::describe(schema, engine, &text, caret.0);
         let here = (doc.path.clone(), doc.caret());
         self.hover_asked = Some(here.clone());
         match found {

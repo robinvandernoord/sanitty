@@ -13,7 +13,8 @@ use std::time::Instant;
 use futures_util::TryStreamExt;
 use sqlx::Column as _;
 use sqlx::Either;
-use sqlx::Row as _;
+use sqlx::Executor as _;
+use sqlx::Statement as _;
 use sqlx::mysql::MySqlConnectOptions;
 use sqlx::mysql::MySqlPool;
 use sqlx::mysql::MySqlPoolOptions;
@@ -41,6 +42,16 @@ pub enum Pool {
     Sqlite(SqlitePool),
 }
 
+impl Pool {
+    pub fn engine(&self) -> Engine {
+        match self {
+            Self::Postgres(_) => Engine::Postgres,
+            Self::MySql(_) => Engine::MySql,
+            Self::Sqlite(_) => Engine::Sqlite,
+        }
+    }
+}
+
 /// What running some SQL gave: the rows of the last statement that returned
 /// any, or else how many rows the statements changed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -60,6 +71,9 @@ pub struct ResultSet {
     /// Every statement only read: no rows means none matched, not none
     /// changed.
     pub reads: bool,
+    /// The last statement returned rows (else its columns are looked up
+    /// separately, when it is a read).
+    pub last_had_rows: bool,
     pub elapsed: Duration,
 }
 
@@ -204,14 +218,29 @@ fn url_has_password(conn: &Connection) -> bool {
 /// Run every statement in `sql`.
 pub async fn run(pool: &Pool, sql: &str) -> Result<ResultSet, String> {
     let started = Instant::now();
-    let reads = super::sql::reads_only(sql);
-    let sql = sqlx::AssertSqlSafe(sql.to_string());
+    let text = sql;
+    let reads = super::sql::reads_only(pool.engine(), text);
+    let sql = sqlx::AssertSqlSafe(text.to_string());
     let mut result = match pool {
         Pool::Postgres(pool) => collect(sqlx::raw_sql(sql).fetch_many(pool)).await,
         Pool::MySql(pool) => collect(sqlx::raw_sql(sql).fetch_many(pool)).await,
         Pool::Sqlite(pool) => run_sqlite(pool, sql).await,
     }
     .map_err(|err| error_text(&err))?;
+    // A read at the end that found nothing still shows its columns.
+    let engine = pool.engine();
+    if !result.last_had_rows
+        && let Some(last) = super::sql::split(engine, text)
+            .last()
+            .and_then(|range| text.get(range.clone()))
+        && super::sql::reads(engine, last)
+        && let Some((columns, origins)) = describe_columns(pool, last).await
+    {
+        result.columns = columns;
+        result.origins = origins;
+        result.rows.clear();
+        result.truncated = false;
+    }
     if let Pool::Postgres(pg_pool) = pool {
         resolve_relations(pg_pool, &mut result).await;
     }
@@ -310,6 +339,7 @@ where
         match item {
             Either::Left(done) => {
                 result.statements += 1;
+                result.last_had_rows = !columns.is_empty();
                 if columns.is_empty() {
                     result.affected += done.rows_affected();
                 } else {
@@ -339,6 +369,7 @@ where
     // A stream that ends without a final result (some drivers) still
     // counts its rows.
     if !columns.is_empty() {
+        result.last_had_rows = true;
         result.columns = columns;
         result.origins = origins;
         result.rows = rows;
@@ -377,11 +408,15 @@ trait Origins {
     fn origin(&self, idx: usize) -> Option<Origin>;
 }
 
-impl Origins for sqlx::postgres::PgRow {
-    fn origin(&self, idx: usize) -> Option<Origin> {
-        let column = self.columns().get(idx)?;
-        let oid = column.relation_id()?;
-        let num = column.relation_attribute_no()?;
+/// Where a column comes from, as each engine's column says.
+trait Source {
+    fn source(&self) -> Option<Origin>;
+}
+
+impl Source for sqlx::postgres::PgColumn {
+    fn source(&self) -> Option<Origin> {
+        let oid = self.relation_id()?;
+        let num = self.relation_attribute_no()?;
         // Looked up by name afterwards, see `resolve_relations`.
         Some(Origin {
             schema: String::new(),
@@ -405,16 +440,49 @@ fn named_origin(origin: &sqlx::ColumnOrigin) -> Option<Origin> {
     })
 }
 
-impl Origins for sqlx::mysql::MySqlRow {
-    fn origin(&self, idx: usize) -> Option<Origin> {
-        named_origin(&self.columns().get(idx)?.origin())
+impl Source for sqlx::mysql::MySqlColumn {
+    fn source(&self) -> Option<Origin> {
+        named_origin(&self.origin())
     }
 }
 
-impl Origins for sqlx::sqlite::SqliteRow {
-    fn origin(&self, idx: usize) -> Option<Origin> {
-        named_origin(&self.columns().get(idx)?.origin())
+impl Source for sqlx::sqlite::SqliteColumn {
+    fn source(&self) -> Option<Origin> {
+        named_origin(&self.origin())
     }
+}
+
+impl<R> Origins for R
+where
+    R: sqlx::Row,
+    <R::Database as sqlx::Database>::Column: Source,
+{
+    fn origin(&self, idx: usize) -> Option<Origin> {
+        self.columns().get(idx)?.source()
+    }
+}
+
+/// The columns a statement would return, without running it (the server
+/// prepares it): for a read that found no rows, so the grid still shows
+/// its headers. `None` when the server cannot prepare it (`EXPLAIN` in
+/// Postgres, say).
+async fn describe_columns(
+    pool: &Pool,
+    statement: &str,
+) -> Option<(Vec<String>, Vec<Option<Origin>>)> {
+    fn split<C: sqlx::Column + Source>(columns: &[C]) -> (Vec<String>, Vec<Option<Origin>>) {
+        columns
+            .iter()
+            .map(|column| (column.name().to_string(), column.source()))
+            .unzip()
+    }
+    let sql = || sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(statement.to_string()));
+    let found = match pool {
+        Pool::Postgres(pool) => split(pool.prepare(sql()).await.ok()?.columns()),
+        Pool::MySql(pool) => split(pool.prepare(sql()).await.ok()?.columns()),
+        Pool::Sqlite(pool) => split(pool.prepare(sql()).await.ok()?.columns()),
+    };
+    (!found.0.is_empty()).then_some(found)
 }
 
 /// Each engine's query result, for the rows a statement changed.
@@ -595,6 +663,13 @@ mod tests {
             })
         };
         assert_eq!(named.origins, [origin("id"), origin("name"), None]);
+
+        // A read that finds nothing still has its columns (and where they
+        // come from); the last statement's result wins.
+        let empty = run(&pool, "select 1 as one; select id, name from item where 0").await?;
+        assert_eq!(empty.columns, ["id", "name"]);
+        assert_eq!(empty.rows.len(), 0);
+        assert_eq!(empty.origins.first(), Some(&origin("id")));
 
         let schema = schema(&pool).await?;
         let listed: Vec<(&str, bool)> = schema
