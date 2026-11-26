@@ -1,6 +1,6 @@
 [package]
 name = "sanitty"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
 description = "A little sanity for your tty: a non-modal IDE for the terminal"
