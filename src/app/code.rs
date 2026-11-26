@@ -23,6 +23,7 @@ use crate::picker::Target;
 
 use super::App;
 use super::Overlay;
+use super::Screen;
 
 impl App {
     /// F8 / Shift+F8: the next problem in this file, else the first one in the
@@ -217,6 +218,8 @@ impl App {
 
     pub(super) fn request_nav(&mut self, nav: Nav) {
         self.sync_lsp();
+        // The answer is used only while the caret is still here.
+        self.nav_asked = self.here().filter(|_| !self.home);
         let Some(doc) = self.cur() else {
             return;
         };
@@ -250,6 +253,17 @@ impl App {
     }
 
     pub(super) fn on_locations(&mut self, nav: Nav, locs: Vec<Location>) {
+        // A late answer: the caret or file moved, another view or a popup
+        // is open, or it was answered already. Jumping now would surprise.
+        let asked = self.nav_asked.take();
+        let unchanged = asked.is_some()
+            && asked == self.here()
+            && !self.home
+            && self.screen == Screen::Code
+            && matches!(self.overlay, Overlay::None);
+        if !unchanged {
+            return;
+        }
         self.status.clear();
         let here = self
             .docs

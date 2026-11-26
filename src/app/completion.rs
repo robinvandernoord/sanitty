@@ -343,15 +343,13 @@ impl App {
             .map(|text| text.lines().next().unwrap_or(text).to_string());
         let mut plan = plan_accept(item, start, end, additional);
         plan.edits.sort_by_key(|edit| edit.range.start);
-        if !doc.apply_edits(plan.edits) {
+        // The main caret goes where the item says (a snippet's placeholder
+        // selected); other carets stay, moved with the text.
+        let head = plan.select_to.unwrap_or(plan.caret);
+        if !doc.apply_at_main(plan.edits, plan.caret, head) {
             self.status = "Code completion failed: the edit did not apply".into();
             return;
         }
-        match plan.select_to {
-            Some(select_to) => doc.state.set_selection(&doc.buffer, plan.caret, select_to),
-            None => doc.state.place_caret(plan.caret),
-        }
-        doc.state.reveal(&doc.buffer, plan.caret);
         if let Some(line) = added {
             self.status = format!("Added: {line}");
         }

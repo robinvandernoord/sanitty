@@ -341,6 +341,19 @@ impl Doc {
     /// Apply raw edits (e.g. from an LSP rename) whose columns are already in
     /// chars. The caret stays where it was, clamped.
     pub fn apply_edits(&mut self, edits: Vec<TextEdit>) -> bool {
+        self.apply_edits_placing(edits, None)
+    }
+
+    /// Apply edits made at the main caret (a completion), then put the main
+    /// caret there: at `head`, selecting from `anchor` when they differ. The
+    /// other carets move with the text, and redo puts them all back here.
+    pub fn apply_at_main(&mut self, edits: Vec<TextEdit>, anchor: LineCol, head: LineCol) -> bool {
+        self.apply_edits_placing(edits, Some(Selection { anchor, head }))
+    }
+
+    /// [`apply_edits`](Self::apply_edits), with the main caret going to
+    /// `main` when given (else it moves with the text).
+    fn apply_edits_placing(&mut self, edits: Vec<TextEdit>, main: Option<Selection>) -> bool {
         let change = Change::new(self.buffer.version(), edits);
         let caret = self.caret();
         let before = self.state.cursors().clone();
@@ -355,20 +368,30 @@ impl Doc {
         };
         if before.selections.len() > 1 {
             // Every caret moves with the text (a rename, a reformat).
-            let primary = before
-                .selections
-                .get(before.primary)
-                .map_or(Selection::caret(caret), |selection| {
-                    editing::map_selection(*selection, &change.edits)
-                });
+            let primary = main.unwrap_or_else(|| {
+                before
+                    .selections
+                    .get(before.primary)
+                    .map_or(Selection::caret(caret), |selection| {
+                        editing::map_selection(*selection, &change.edits)
+                    })
+            });
             self.keep_others(&before, &change.edits, primary);
-            self.note_carets();
-            self.rehighlight(&applied.edits);
-            return true;
+        } else {
+            match main {
+                Some(selection) if !selection.is_empty() => {
+                    self.state
+                        .set_selection(&self.buffer, selection.anchor, selection.head);
+                }
+                Some(selection) => self.state.place_caret(selection.head),
+                None => self.state.place_caret(self.buffer.clamp(caret)),
+            }
         }
-        let clamped = self.buffer.clamp(caret);
-        self.state.place_caret(clamped);
+        // Only now, with every caret in its final place.
         self.note_carets();
+        if let Some(selection) = main {
+            self.state.reveal(&self.buffer, selection.head);
+        }
         self.rehighlight(&applied.edits);
         true
     }
@@ -955,6 +978,25 @@ mod tests {
         let edit = editing::insert(doc.caret(), None, base, "!");
         doc.apply(edit, EditCause::Type);
         assert_eq!(doc.buffer.text(), "a#\nb#two\n!c#three\n");
+        assert_eq!(doc.state.cursors().selections.len(), 2);
+
+        // A completion at the main caret keeps the other caret, and redo
+        // puts the main caret back where the completion left it.
+        let main = doc.caret();
+        let edits = vec![TextEdit {
+            range: Range {
+                start: main,
+                end: main,
+            },
+            new_text: "done".into(),
+        }];
+        let after = LineCol::new(main.line, main.col + 4);
+        assert!(doc.apply_at_main(edits, after, after));
+        assert_eq!(doc.state.cursors().selections.len(), 2);
+        assert_eq!(doc.caret(), after);
+        doc.undo();
+        doc.redo();
+        assert_eq!(doc.caret(), after);
         assert_eq!(doc.state.cursors().selections.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
