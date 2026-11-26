@@ -102,8 +102,7 @@ impl Connection {
             Engine::Sqlite => self
                 .path
                 .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
+                .map_or_default(|path| path.display().to_string()),
             _ if self.url.is_some() => String::new(),
             _ => match &self.host {
                 Some(host) => format!("{}@{host}:{}/{}", self.user, self.port, self.database),

@@ -282,8 +282,7 @@ async fn resolve_relations(pool: &PgPool, result: &mut ResultSet) {
     )
     .await;
     let names: std::collections::HashMap<(String, String), Origin> = found
-        .map(|found| found.rows)
-        .unwrap_or_default()
+        .map_or_default(|found| found.rows)
         .into_iter()
         .filter_map(|row| {
             let mut fields = row.into_iter().map(Option::unwrap_or_default);
