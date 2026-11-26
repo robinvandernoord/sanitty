@@ -15,6 +15,10 @@ fixes:
    instead of sending `null`, which TypeScript 7 (Go) rejects as invalid params,
    so its problems never arrived.
 
+Besides the fixes, `src/semantic_tokens.rs` reads the token data with
+`as_chunks::<5>()` instead of `chunks_exact(5)`, as newer clippy asks; the result
+is the same.
+
 Once a karet-lsp release contains both fixes, sanitty goes back to it and this crate
 is no longer updated.
 
@@ -22,6 +26,6 @@ is no longer updated.
 
 karet-lsp is published under MIT OR Apache-2.0, at the user's option. This crate uses
 and redistributes it under the MIT license; `LICENSE-MIT` is copied from the karet
-repository, since the published crate ships without its license files. The two changes
+repository, since the published crate ships without its license files. The changes
 above, and the package name and description, are the only modifications to the
 published source.

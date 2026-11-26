@@ -74,10 +74,9 @@ impl SemanticTokens {
         let mut line = 0u32;
         let mut start = 0u32;
         let mut out = Vec::with_capacity(self.data.len() / 5);
-        for group in self.data.chunks_exact(5) {
-            let &[delta_line, delta_start, length, ty, bits] = group else {
-                continue;
-            };
+        // Tokens come in groups of five; a short group at the end is dropped.
+        let (groups, _) = self.data.as_chunks::<5>();
+        for &[delta_line, delta_start, length, ty, bits] in groups {
             if delta_line == 0 {
                 start = start.saturating_add(delta_start);
             } else {

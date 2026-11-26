@@ -164,6 +164,9 @@ impl Server {
 #[derive(Default)]
 pub struct Hub {
     clients: HashMap<&'static str, Server>,
+    /// The program each running server is (`ty`, `rust-analyzer`), for the
+    /// top bar: the keys only say which language a server is for.
+    names: HashMap<&'static str, String>,
     starting: HashSet<&'static str>,
     failed: HashMap<&'static str, String>,
 }
@@ -174,6 +177,69 @@ fn server_key(lang: &str) -> &'static str {
         "python" => "python",
         "rust" => "rust",
         _ => "ts",
+    }
+}
+
+/// The project's Python environment: `VIRTUAL_ENV` when set, else a
+/// `.venv` or `venv` in the workspace root (a directory with `pyvenv.cfg`).
+pub fn project_venv(root: &Path) -> Option<PathBuf> {
+    let is_venv = |dir: &Path| dir.join("pyvenv.cfg").is_file();
+    std::env::var_os("VIRTUAL_ENV")
+        .map(PathBuf::from)
+        .filter(|dir| is_venv(dir))
+        .or_else(|| {
+            [".venv", "venv"]
+                .iter()
+                .map(|name| root.join(name))
+                .find(|dir| is_venv(dir))
+        })
+}
+
+/// A server started in `venv`, as `activate` would: `VIRTUAL_ENV` set and
+/// its `bin` first on PATH, through `env` (the spec has no environment of
+/// its own).
+fn in_venv(venv: &Path, program: &str, args: Vec<String>, langs: Vec<String>) -> LspSpec {
+    let bin = venv.join("bin");
+    let path = std::env::var_os("PATH").map_or_else(
+        || bin.display().to_string(),
+        |path| format!("{}:{}", bin.display(), path.to_string_lossy()),
+    );
+    let mut command = vec![
+        format!("VIRTUAL_ENV={}", venv.display()),
+        format!("PATH={path}"),
+        program.to_string(),
+    ];
+    command.extend(args);
+    LspSpec::new("env", command, langs)
+}
+
+/// The server a spec starts, for messages: the program `env` runs, when it
+/// runs in a venv.
+fn program_name(spec: &LspSpec) -> String {
+    if spec.command == "env" {
+        spec.args
+            .iter()
+            .find(|arg| !arg.contains('='))
+            .cloned()
+            .unwrap_or_else(|| spec.command.clone())
+    } else {
+        spec.command.clone()
+    }
+}
+
+/// No server for `lang` is installed: which to install, and how.
+fn not_found(lang: &str) -> String {
+    match server_key(lang) {
+        "python" => "No Python language server found, in the project's venv or on PATH. \
+             Install ty: `uv add --dev ty` in the project, or `uv tool install ty` \
+             (basedpyright, pyright and pylsp work too)"
+            .into(),
+        "rust" => "No Rust language server found. Install rust-analyzer: \
+             `rustup component add rust-analyzer`"
+            .into(),
+        _ => "No TypeScript language server found. Install TypeScript 7 \
+             (`npm install -D typescript@7`) or typescript-language-server"
+            .into(),
     }
 }
 
@@ -238,16 +304,26 @@ fn spec_for(key: &str, root: &Path) -> Option<LspSpec> {
             ],
         )],
     };
-    let spec = candidates
-        .iter()
-        .find(|(cmd, _, _)| on_path(cmd))
-        .map(|(cmd, args, langs)| {
-            LspSpec::new(
-                *cmd,
-                args.iter().map(|arg| (*arg).to_string()).collect(),
-                langs.iter().map(|lang| (*lang).to_string()).collect(),
-            )
-        })?;
+    // Python servers run in the project's environment: one installed there
+    // (`uv add --dev ty`) wins over one on PATH, and either way the server
+    // gets that environment, so it resolves the project's imports.
+    let venv = matches!(key, "python" | "ruff")
+        .then(|| project_venv(root))
+        .flatten();
+    let spec = candidates.iter().find_map(|(cmd, args, langs)| {
+        let program = venv
+            .as_ref()
+            .map(|venv| venv.join("bin").join(cmd))
+            .filter(|path| path.is_file())
+            .map(|path| path.display().to_string())
+            .or_else(|| on_path(cmd).then(|| (*cmd).to_string()))?;
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let langs = langs.iter().map(|lang| (*lang).to_string()).collect();
+        Some(match &venv {
+            Some(venv) => in_venv(venv, &program, args, langs),
+            None => LspSpec::new(program, args, langs),
+        })
+    })?;
     if spec.command == "typescript-language-server" {
         // It needs TypeScript itself, and only looks in the project's
         // node_modules. Projects without one (own bundler, no package.json)
@@ -352,16 +428,47 @@ impl Hub {
     }
 
     pub fn status(&self) -> String {
-        let mut parts: Vec<String> = self.clients.keys().map(|key| (*key).to_string()).collect();
+        // Running servers by program; starting and failed ones by language,
+        // as which program it will be is not known yet.
+        let mut parts: Vec<String> = self
+            .clients
+            .keys()
+            .map(|key| {
+                self.names
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| (*key).to_string())
+            })
+            .collect();
         parts.extend(self.starting.iter().map(|key| format!("{key}..")));
         parts.extend(
             self.failed
                 .iter()
                 .filter(|(_, msg)| !msg.is_empty())
-                .map(|(key, _)| format!("{key}!")),
+                .map(|(key, _)| format!("{key} failed")),
         );
         parts.sort();
         parts.join(" ")
+    }
+
+    /// Why `lang`'s main server cannot answer, for a feature that needs it.
+    /// One that failed is looked for again, so a server installed since
+    /// works without a restart (a failure is otherwise remembered, so it is
+    /// not looked up on every key).
+    pub fn unavailable(&mut self, lang: &str, root: &Path, tx: &UnboundedSender<Event>) -> String {
+        let key = server_key(lang);
+        if self.starting.contains(key) {
+            return format!("The {lang} language server is still starting");
+        }
+        let reason = self.failed.remove(key);
+        for key in server_keys(lang) {
+            self.failed.remove(key);
+        }
+        self.ensure(lang, root, tx);
+        match reason {
+            Some(reason) if !reason.is_empty() => format!("{reason}. Looking again..."),
+            _ => format!("Starting the {lang} language server..."),
+        }
     }
 
     /// Start the servers for `lang` that are not running or starting yet.
@@ -401,12 +508,12 @@ impl Hub {
                 let msg = if is_linter(key) {
                     String::new()
                 } else {
-                    format!("No language server found for {lang}")
+                    not_found(&lang)
                 };
                 let _ = tx.send(Event::LspFailed(key, msg));
                 return;
             };
-            let name = spec.command.clone();
+            let name = program_name(&spec);
             match LspClient::spawn(spec, &root).await {
                 Ok(client) => {
                     let client = Arc::new(client);
@@ -435,7 +542,10 @@ impl Hub {
                             }
                         }
                     });
-                    let _ = tx.send(Event::LspReady(key, client));
+                    let program = Path::new(&name)
+                        .file_name()
+                        .map_or_else(|| name.clone(), |file| file.to_string_lossy().into_owned());
+                    let _ = tx.send(Event::LspReady(key, program, client));
                 }
                 Err(err) => {
                     let _ = tx.send(Event::LspFailed(key, format!("{name}: {err}")));
@@ -445,8 +555,9 @@ impl Hub {
     }
 
     /// Take a server that finished starting; returns it, ready for use.
-    pub fn ready(&mut self, key: &'static str, client: Arc<LspClient>) -> Server {
+    pub fn ready(&mut self, key: &'static str, program: String, client: Arc<LspClient>) -> Server {
         self.starting.remove(key);
+        self.names.insert(key, program);
         let server = Server::new(client);
         self.clients.insert(key, server.clone());
         server
@@ -818,3 +929,37 @@ pub fn describe(loc: &Location, root: &Path) -> (String, String) {
 }
 
 pub type Edit = WorkspaceEdit;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server installed in the project's `.venv` is used, and started in
+    /// that environment.
+    #[test]
+    fn python_servers_come_from_the_project_venv() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("sanitty-venv-{}", std::process::id()));
+        let bin = root.join(".venv").join("bin");
+        std::fs::create_dir_all(&bin)?;
+        std::fs::write(root.join(".venv").join("pyvenv.cfg"), "home = /usr/bin\n")?;
+        let ty_path = bin.join("ty");
+        std::fs::write(&ty_path, "#!/bin/sh\n")?;
+        std::fs::set_permissions(&ty_path, std::fs::Permissions::from_mode(0o755))?;
+        if std::env::var_os("VIRTUAL_ENV").is_none() {
+            let spec = spec_for("python", &root).ok_or("no spec")?;
+            assert_eq!(spec.command, "env");
+            let venv = format!("VIRTUAL_ENV={}", root.join(".venv").display());
+            assert!(spec.args.contains(&venv), "{:?}", spec.args);
+            assert!(
+                spec.args
+                    .iter()
+                    .any(|arg| arg.starts_with(&format!("PATH={}:", bin.display())))
+            );
+            assert_eq!(program_name(&spec), ty_path.display().to_string());
+            assert_eq!(spec.args.last().map(String::as_str), Some("server"));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+}
