@@ -46,7 +46,7 @@ sudo apt update && sudo apt install sanitty
 cargo binstall sanitty
 ```
 
-**From source**, with Rust 1.94 or newer and a C compiler for the Tree-sitter parsers:
+**From source**, with Rust 1.100 or newer and a C compiler for the Tree-sitter parsers:
 
 ```sh
 cargo install sanitty

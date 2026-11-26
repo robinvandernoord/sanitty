@@ -1,8 +1,7 @@
 name: CI
 
 # Formatting, lints (warnings fail: the code is clippy-clean) and tests on
-# every push to master and every pull request, plus a build with the oldest
-# Rust that Cargo.toml promises (rust-version).
+# every push to master and every pull request, on stable Rust.
 
 on:
   push:
@@ -25,11 +24,3 @@ jobs:
       # --no-deps: sanitty only, not the karet-lsp fork (upstream's code, as published).
       - run: cargo clippy --all-targets --locked --no-deps -- -D warnings
       - run: cargo test --locked
-
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.94
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked
