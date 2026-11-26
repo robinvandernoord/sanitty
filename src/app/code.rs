@@ -197,6 +197,9 @@ impl App {
     }
 
     pub(super) fn request_hover(&mut self, popup: bool) {
+        if self.sql_hover(popup) {
+            return;
+        }
         self.sync_lsp();
         let Some(doc) = self.cur() else {
             return;

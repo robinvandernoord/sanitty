@@ -26,7 +26,12 @@ const PAGE: isize = 10;
 
 impl App {
     /// Alt+J: ask the file's language server what can go at the caret.
+    /// SQL (the Database view's query, a `.sql` file) is completed from the
+    /// connection's schema instead.
     pub(super) fn start_completion(&mut self) {
+        if self.sql_completion() {
+            return;
+        }
         // The server must see the text as it is now.
         self.sync_lsp();
         let Some(doc) = self.cur() else { return };
@@ -64,7 +69,7 @@ impl App {
             generation,
             self.tx.clone(),
         );
-        self.completion = Some(Completion::new(generation, path, client, anchor));
+        self.completion = Some(Completion::new(generation, path, Some(client), anchor));
     }
 
     pub(super) fn on_completions(
@@ -235,7 +240,9 @@ impl App {
             return;
         }
         // A list the server cut short is asked for again with the longer word.
-        if popup.incomplete {
+        if popup.incomplete
+            && let Some(client) = popup.client.clone()
+        {
             self.sync_lsp();
             let Some(doc) = self.cur() else { return };
             let pos16 = doc.caret_utf16();
@@ -246,7 +253,7 @@ impl App {
             };
             popup.generation = generation;
             lsp::complete(
-                popup.client.clone(),
+                client,
                 popup.path.clone(),
                 pos16,
                 CompletionTrigger::Incomplete,
@@ -278,9 +285,12 @@ impl App {
         if item.payload.is_none() || popup.resolving.contains(&idx) {
             return;
         }
+        let Some(client) = popup.client.clone() else {
+            return;
+        };
         let item = item.clone();
         popup.resolving.push(idx);
-        lsp::resolve_completion(popup.client.clone(), item, popup.list, idx, self.tx.clone());
+        lsp::resolve_completion(client, item, popup.list, idx, self.tx.clone());
     }
 
     /// Enter: put the selected item in, replacing the whole word around the
@@ -349,7 +359,7 @@ impl App {
 }
 
 /// Where the word before the caret starts.
-fn word_start(doc: &Doc) -> LineCol {
+pub(super) fn word_start(doc: &Doc) -> LineCol {
     let caret = doc.caret();
     let line = doc.buffer.line(caret.line as usize).unwrap_or_default();
     let before: Vec<char> = line.chars().take(caret.col as usize).collect();
@@ -379,7 +389,7 @@ fn to_u32(count: usize) -> u32 {
 }
 
 /// The text from `anchor` to the caret.
-fn prefix(doc: &Doc, anchor: LineCol) -> String {
+pub(super) fn prefix(doc: &Doc, anchor: LineCol) -> String {
     let caret = doc.caret();
     if caret.line != anchor.line || caret.col < anchor.col {
         return String::new();

@@ -5,6 +5,7 @@ use crossterm::event::KeyEvent;
 
 use super::App;
 use super::Overlay;
+use super::Screen;
 use crate::Event;
 use crate::clipboard::Via;
 use crate::keymap::Action;
@@ -15,13 +16,13 @@ use crate::review::git;
 impl App {
     /// Alt+9: open the Review view, or go back to the code.
     pub(super) fn toggle_review(&mut self) {
-        if self.in_review {
-            self.in_review = false;
+        if self.in_review() {
+            self.screen = Screen::Code;
             return;
         }
         self.close_overlay();
         self.completion = None;
-        self.in_review = true;
+        self.screen = Screen::Review;
         let root = self.root.clone();
         let review = self.review.get_or_insert_with(|| Review::new(root));
         let outcome = review.open();
@@ -29,15 +30,16 @@ impl App {
     }
 
     /// Keys while the Review view is on screen. True when it used the key.
-    /// Global keys that still work there: the view's own key, Quit and All
-    /// Keys, and anything while a popup (All Keys) is open.
+    /// Global keys that still work there: the view's own key, the Database
+    /// view's, Quit and All Keys, and anything while a popup (All Keys) is
+    /// open.
     pub(super) fn review_key(&mut self, key: &KeyEvent, action: Option<Action>) -> bool {
-        if !self.in_review || !matches!(self.overlay, Overlay::None) {
+        if !self.in_review() || !matches!(self.overlay, Overlay::None) {
             return false;
         }
         if matches!(
             action,
-            Some(Action::Review | Action::Quit | Action::AllKeys)
+            Some(Action::Review | Action::Database | Action::Quit | Action::AllKeys)
         ) {
             return false;
         }
@@ -70,7 +72,7 @@ impl App {
                     (Via::Terminal, None) => format!("{status} Sent through the terminal"),
                 };
             }
-            Outcome::Leave => self.in_review = false,
+            Outcome::Leave => self.screen = Screen::Code,
             Outcome::Load(source) => {
                 let tx = self.tx.clone();
                 tokio::task::spawn_blocking(move || {

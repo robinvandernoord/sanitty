@@ -28,6 +28,7 @@ use crate::picker::Picker;
 
 mod code;
 mod completion;
+mod database;
 mod input;
 mod navigate;
 mod review;
@@ -57,6 +58,18 @@ enum Overlay {
     KeyCheck(KeyCheck),
     /// Quick documentation (Alt+H): the hover text under the caret.
     Doc(String),
+    /// The result of Run SQL from a file, over the code.
+    DbResult(crate::database::grid::Grid),
+    /// SQL from a file that writes, shown before it runs.
+    DbConfirm(String),
+}
+
+/// The full-screen view on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Screen {
+    Code,
+    Review,
+    Database,
 }
 
 /// Something the app asks the main loop to do after handling an event.
@@ -126,8 +139,16 @@ pub struct App {
     search_gen: Arc<AtomicU64>,
     /// The Review view's state, kept while switching back to the code.
     review: Option<crate::review::Review>,
-    /// The Review view is on screen.
-    in_review: bool,
+    /// Which view is on screen.
+    screen: Screen,
+    /// The Database view's state, kept while switching back to the code.
+    database: Option<crate::database::Database>,
+    /// The file (and home screen) to go back to when leaving it.
+    db_return: Option<(Option<PathBuf>, bool)>,
+    /// The query editor's file, once connected.
+    db_scratch: Option<PathBuf>,
+    /// Where the editor was last drawn, for popups at its caret.
+    editor_area: ratatui::layout::Rect,
     /// What the main loop should do next, if anything.
     pub request: Option<Request>,
     /// Whether the terminal speaks the kitty keyboard protocol.
@@ -137,11 +158,7 @@ pub struct App {
 impl App {
     pub fn new(root: PathBuf, tx: UnboundedSender<Event>) -> Self {
         let (keymap, problems) = Keymap::load();
-        let theme = crate::config_dir()
-            .map(|dir| dir.join("theme.json"))
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|json| Theme::load_vscode(&json).ok())
-            .unwrap_or_else(Theme::dark);
+        let theme = Theme::dark();
         Self {
             root,
             docs: Vec::new(),
@@ -176,9 +193,21 @@ impl App {
             search_gen: Arc::new(AtomicU64::new(0)),
             request: None,
             review: None,
-            in_review: false,
+            screen: Screen::Code,
+            database: None,
+            db_return: None,
+            db_scratch: None,
+            editor_area: ratatui::layout::Rect::default(),
             enhanced_keys: false,
         }
+    }
+
+    fn in_review(&self) -> bool {
+        self.screen == Screen::Review
+    }
+
+    fn in_db(&self) -> bool {
+        self.screen == Screen::Database
     }
 
     fn doc(&mut self) -> Option<&mut Doc> {
@@ -229,6 +258,10 @@ impl App {
                     review.loaded(result);
                 }
             }
+            event @ (Event::DbFound(..)
+            | Event::DbConnected(..)
+            | Event::DbSchema(..)
+            | Event::DbResult(..)) => self.db_event(event),
             Event::CompletionResolved(list, index, item) => {
                 self.on_completion_resolved(list, index, item);
             }

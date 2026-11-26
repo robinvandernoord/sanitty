@@ -4,7 +4,8 @@ A PyCharm-flavoured terminal IDE built on the published `karet-*` crates. It run
 the office PC over SSH (from Ghostty, sometimes the T3 integrated terminal), so files,
 language servers, git, docker and databases are all local to it.
 
-Status: approved plan; shortcuts are starting defaults. Milestone 1 is built.
+Status: approved plan; shortcuts are starting defaults. Milestones 1 to 4 are built;
+milestone 4 (Database) awaits its demo.
 
 ## Principles
 
@@ -24,10 +25,10 @@ Three top-level views, each taking the whole screen.
 |----------|---------|----------------------------------------------|
 | Code     |         | Editing and navigation (default)             |
 | Review   | `Alt+9` | Diffs and review comments                    |
-| Database | (later) | Schema, queries, result grids, row editing   |
+| Database | `Alt+8` | Schema, queries, result grids, row editing   |
 
-A view's key opens it and, pressed again, goes back to the code. The Database key is
-chosen in milestone 4 (Alt+D, planned earlier, is now Duplicate Line).
+A view's key opens it and, pressed again, goes back to the code. The Database view sits
+on `Alt+8`, next to Review (Alt+D, planned earlier, is now Duplicate Line).
 
 ### Code view
 
@@ -127,25 +128,60 @@ here.
 ### Database view
 
 ```
- [Database]  shop-db (postgres, from docker compose: db)
-+- schema ---------++- query.sql ----------------------------------------------+
-| v public         || select id, email, created_at from auth_user              |
-|   > auth_user    || where created_at > now() - interval '1 day';             |
-|   > shop_order   |+----------------------------------------- Alt+Enter run -+
-|   > shop_product |+- 3 rows, 12 ms ------------------------------------------+
-| > audit          || id | email               | created_at                    |
-|                  || 41 | a@example.nl        | 2026-11-19 09:12              |
-+------------------++- Enter edit cell, Ctrl+S write (shows SQL first) -------+
+ Database   db (postgres, app@127.0.0.1:5460/app, from docker compose: db)   76 tables
++- schema ---------++- db.sql ------------------------------------ Alt+Enter run -+
+| > audit          || select id, email, created_at from auth_user                |
+| v public         || where created_at > now() - interval '1 day';               |
+|   > auth_user    |+------------------------------------------------------------+
+|   > shop_order   |+- 3 rows, 12 ms ---------------------- Enter edits a cell -+
+|   > shop_product ||   id | email               | created_at                    |
+|                  || 1 41 | a@example.nl        | 2026-11-19 09:12              |
++------------------++------------------------------------------------------------+
+ Enter Open table  Right/Left Expand  s Select in query  / Filter  c Connections
 ```
 
-- Engines: PostgreSQL, MySQL/MariaDB, SQLite (one driver layer, `sqlx`).
-- Connections: discovered from `docker compose config` (service image plus its
-  `POSTGRES_*` / `MYSQL_*` / `MARIADB_*` env vars and published ports), overridden or
-  extended in `.sanitty/db.toml`.
-- Safety: every write (inline edit, UPDATE, DELETE, DDL) shows the exact SQL and asks for
-  confirmation. Inline edits need a primary key and generate `UPDATE ... WHERE pk = ...`.
-- From the Code view, `Alt+Enter` in a `.sql` file runs the selection (or the statement
-  under the caret) against the active connection and shows the grid in a bottom popup.
+- Engines: PostgreSQL, MySQL/MariaDB, SQLite (one driver layer, `sqlx`). SQL runs over
+  each server's text protocol, so several statements run at once and every value shows
+  as text (NULL dimmed, bytes as `\x..` hex). A result keeps at most 10,000 rows.
+- Connections: discovered from `docker compose config`: a service counts by its image
+  (postgres, postgis, timescaledb, pgvector, mysql, mariadb, percona) or, for images built
+  locally, by the server's own `POSTGRES_*` / `MYSQL_*` / `MARIADB_*` variables (clients
+  with only a `POSTGRES_URI` do not). A published port is used on the host; an unpublished
+  one through the running container's address. `.sanitty/db.toml` overrides a service
+  (an entry with its name) or adds connections (`url`, or host/port/user/database, or a
+  SQLite `path`; `password_env` reads the password from the environment).
+- Opening: `Alt+8` finds the connections the first time and connects to the one used
+  last, or the only one; otherwise a list asks. `c` switches, `r` reads the schema again.
+- Panes: schema tree, query editor, result grid; `Tab` moves between them (in the query
+  editor, where Tab indents, `Shift+Tab`). The tree hides the schema level when there is
+  only one; `/` filters tables by name, Enter opens a table's rows (500, by primary key),
+  `s` puts `select * from` it in the query.
+- Copying in the tree and grid: `y` copies the name or the value under the cursor;
+  `Ctrl+C` leaves the view, as everywhere. (Ctrl+Shift+C was tried: T3 takes it before
+  its terminal sees it, so no program in T3's terminal can use it.)
+- Query editor: a scratch `.sql` file per connection in `~/.local/state/sanitty/`, edited
+  with all the usual keys, saved when leaving the view. `Alt+Enter` runs the selection or
+  the statement under the caret (a caret right after a `;` still means that statement).
+- SQL help from the schema (there is no SQL language server), in the query editor and in
+  `.sql` files once connected: `Alt+J` completes columns of the statement's tables
+  (`alias.` and `table.` narrow to one table, `schema.` to its tables), table names and
+  keywords; `Alt+H` shows a table's definition or a column's type; resting the caret on a
+  name shows its type in the bottom line. The hint bar shows these keys for SQL.
+- Keys in the view: editing and SQL help work in the query editor; going elsewhere (Go to
+  File, Recent Files, the tree, Review, ...) goes back to the code first; code features
+  that mean nothing for SQL (definition, usages, rename, reformat, problems, close file)
+  say so in the status line and stay.
+- Safety: every write (anything but select/show/explain/values/with-without-writes, so
+  unknown statements too) shows the exact SQL and asks for confirmation. Cells of any
+  result can be edited (a table opened from the tree, `select *`, some columns, a join)
+  when the server says the column is a table's (renamed columns too, computed ones not)
+  and that table's primary key is in the result as well; otherwise Enter says what is
+  missing. Enter edits the cell (Tab makes it NULL), the generated
+  `UPDATE ... WHERE pk = ...` is shown first, and the query runs again after. DDL reads
+  the schema again.
+- From the Code view, `Alt+Enter` in any file runs the selection (or the statement under
+  the caret) against the active connection and shows the grid in a bottom popup (writes are
+  confirmed first). Without a connection it says so; `Alt+8` makes one.
 
 ### Terminal
 
@@ -215,6 +251,7 @@ key check (`sanitty --check-keys`, 2026-11-19).
 | Recent files             | `Alt+E` (`Enter` = previous file) |
 | Project tree             | `Alt+1`          |
 | Review view (and back)   | `Alt+9`          |
+| Database view (and back) | `Alt+8`          |
 | Navigate back / forward  | `Alt+,` / `Alt+.` |
 | Find in file             | `Ctrl+F`         |
 | Replace in file          | `Alt+R`          |
@@ -230,6 +267,7 @@ key check (`sanitty --check-keys`, 2026-11-19).
 | Comment line             | `Alt+/`          |
 | Reformat file            | `Alt+L`          |
 | Code completion          | `Alt+J`          |
+| Run SQL                  | `Alt+Enter`      |
 | Duplicate line           | `Alt+D`          |
 | Delete line              | `Alt+Y`          |
 | Undo / redo              | `Ctrl+Z` / `Alt+Z` |
@@ -250,8 +288,8 @@ them. Inside the find bar, `Alt+C` / `Alt+W` / `Alt+X` toggle case, words and re
 128 keys arrive in both terminals and are bound to nothing; these are the pool for new
 bindings. Prefer Alt, then Ctrl+Alt.
 
-- Alt: 2, 3, 4, 5, 7, 8, 0, `-`, `=`, Backspace; U, O, P, `[`, `]`, `\`; A, `;`, `'`,
-  Enter (planned: run SQL); X, C, V, M; Up, Down
+- Alt: 2, 3, 4, 5, 7, 0, `-`, `=`, Backspace; U, O, P, `[`, `]`, `\`; A, `;`, `'`,
+  X, C, V, M; Up, Down
 - Ctrl+Alt: Q, W, E, R, T, Y, U, I, O, P; S, D, F, G, H, J, K, L; Z, X, C, V, N, M;
   Shift+N; Up, Down, Left, Right
 - F-keys: F4, F5, F7, F9, F10, F11, F12; Shift+F1, F2, F4, F5, F7, F9, F10, F11, F12;
@@ -259,15 +297,16 @@ bindings. Prefer Alt, then Ctrl+Alt.
 - Ctrl (avoid, see above): E, R, T, Y, U, O, P, `]`, `\`, D, G, K, L, `;`, `'`, `.`, `/`,
   PageUp, PageDown, Up, Down
 - Ctrl+Shift (last resort: older terminals fold it into Ctrl+letter): R, Y, S, G, H, K,
-  L, Z, X, C, B, M
+  L, Z, X, B, M
 - Shift: Tab, Enter, Delete
 
 Ctrl+I, Ctrl+M, Ctrl+H and Ctrl+[ also arrived in both, but only because both speak the
 kitty keyboard protocol: everywhere else (tmux, older terminals) they are Tab, Enter,
-Backspace and Esc, so they are left out. Not usable: Ctrl+Space and F6 (T3 swallows
-them), Alt+Left/Right (arrive as Alt+B/F in T3), Ctrl+digits (T3), Ctrl+Enter,
-Ctrl+`,`, Ctrl+0, Ctrl+`-`, Ctrl+`=` (Ghostty), Alt+F4 (closes the window), Alt+Space
-(opens Espanso on Robin's desktop, though it arrived in both terminals).
+Backspace and Esc, so they are left out. Not usable: Ctrl+Space, F6 and Ctrl+Shift+C (T3
+swallows them; Ctrl+Shift+C reaches no program in T3's terminal, checked 2026-11-26),
+Alt+Left/Right (arrive as Alt+B/F in T3), Ctrl+digits (T3), Ctrl+Enter, Ctrl+`,`,
+Ctrl+0, Ctrl+`-`, Ctrl+`=` (Ghostty), Alt+F4 (closes the window), Alt+Space (opens
+Espanso on Robin's desktop, though it arrived in both terminals).
 
 ## Architecture
 
@@ -291,13 +330,14 @@ One Rust binary.
 - `sqlx`: databases.
 - Own code: views, popups, keymap, config, review model, compose discovery.
 
-Config lives in `~/.config/sanitty/` (keymap, theme, settings) and per project in
+Config lives in `~/.config/sanitty/` (keymap, settings) and per project in
 `.sanitty/` (db connections). Review state lives in `~/.local/state/sanitty/`.
 
 ## Milestones
 
-1. **Editor shell** (done, awaiting demo): editing, highlighting, go to file, recent
-   files, previous file, project tree, find action, keymap file, shell, rainbow CSV.
+1. **Editor shell** (done): editing, highlighting, go to file, recent
+   files, previous file, project tree, find action, find and replace, find in files,
+   keymap file, shell, rainbow CSV.
 2. **LSP** (done): definition, implementation, usages, rename, problems (ty and
    ruff for Python), quick documentation, reformat and code completion work; ty is the
    default Python server. Large-repo check done: a 54k-file tree indexes in 0.3 s, the launcher
@@ -308,8 +348,11 @@ Config lives in `~/.config/sanitty/` (keymap, theme, settings) and per project i
 3. **Review** (done): the Review view with four sources (your changes, this branch vs
    main, commits, a GitHub PR), split and inline diffs in syntax colours, line and range
    comments, viewed marks, Markdown export, state kept between runs.
-4. **Database**: compose discovery, schema tree, query editor, result grid, confirmed
-   writes, `Alt+Enter` from `.sql` files.
-5. **Polish**: search in files, multi-caret, VS Code theme loading, settings file.
+4. **Database** (done, awaiting demo): compose discovery, schema tree, query editor,
+   result grid, confirmed writes and cell edits, `Alt+Enter` from `.sql` files. Tested
+   against Postgres (compose-built image), MariaDB and MySQL (published and unpublished
+   ports) and SQLite. Not yet: MySQL `#` comments when splitting statements, column
+   headers for a query that returns no rows.
+5. **Polish**: multi-caret, settings file.
 
 Each milestone ends with a short demo for approval before the next one starts.

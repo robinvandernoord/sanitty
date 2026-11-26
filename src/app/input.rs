@@ -27,6 +27,7 @@ use crate::picker::Target;
 use super::App;
 use super::Overlay;
 use super::Request;
+use super::database::InDb;
 use super::file_name;
 use super::parent_dir;
 use super::save_keycheck;
@@ -34,7 +35,10 @@ use super::visible;
 
 impl App {
     pub(super) fn on_paste(&mut self, text: &str) {
-        if self.in_review && matches!(self.overlay, Overlay::None) {
+        if self.db_paste(text) {
+            return;
+        }
+        if self.in_review() && matches!(self.overlay, Overlay::None) {
             if let Some(review) = &mut self.review {
                 review.paste(text);
             }
@@ -70,6 +74,12 @@ impl App {
         self.armed = self.confirm.take();
         let action = self.keymap.lookup(&key);
         if self.review_key(&key, action) {
+            return;
+        }
+        if self.db_key(&key, action) {
+            return;
+        }
+        if self.db_overlay_key(&key, action) {
             return;
         }
         if self.completion_key(&key, action) {
@@ -137,7 +147,7 @@ impl App {
                 self.find_overlay_key(key, action);
                 true
             }
-            Overlay::KeyCheck(_) => true,
+            Overlay::KeyCheck(_) | Overlay::DbResult(_) | Overlay::DbConfirm(_) => true,
             // Any key closes the documentation popup; only Esc is used up by it.
             Overlay::Doc(_) => {
                 self.overlay = Overlay::None;
@@ -292,6 +302,18 @@ impl App {
     }
 
     pub(super) fn run(&mut self, action: Action) {
+        // In the Database view, editing and SQL help work, going elsewhere
+        // leaves it, and code-only features say they do not apply.
+        if self.in_db() {
+            match Self::in_db_view(action) {
+                InDb::Keep => {}
+                InDb::Leave => self.leave_database(),
+                InDb::Unavailable => {
+                    self.status = format!("{} does not work in the Database view", action.label());
+                    return;
+                }
+            }
+        }
         match action {
             Action::None => {}
             Action::Quit => self.quit_or_warn(),
@@ -309,7 +331,12 @@ impl App {
             Action::Find | Action::Replace => self.open_find_bar(action == Action::Replace),
             Action::FindNext | Action::FindPrev => self.find_step(action == Action::FindNext),
             Action::RecentFiles => self.show_recent_files(),
-            Action::Review => self.toggle_review(),
+            Action::Review => {
+                self.leave_database();
+                self.toggle_review();
+            }
+            Action::Database => self.toggle_database(),
+            Action::RunSql => self.run_query(),
             Action::ToggleExplorer => self.open_tree(),
             Action::GotoDefinition => self.request_nav(Nav::Definition),
             Action::QuickDoc => self.request_hover(true),
@@ -365,6 +392,8 @@ impl App {
     }
 
     fn quit_or_warn(&mut self) {
+        // The Database view's query is saved, not warned about.
+        self.save_scratch();
         let dirty: Vec<String> = self
             .docs
             .iter()
@@ -520,13 +549,20 @@ impl App {
             .insert(closed.path.clone(), closed.lsp_version);
         let closed = closed.path;
         self.status.clear();
-        // Fall back to the most recently used file that is still open.
-        self.active = self
+        // Fall back to the most recently used file that is still open; with
+        // none left, the home screen (the Database view's query file stays
+        // open, but is not one of yours).
+        if let Some(idx) = self
             .recent
             .iter()
             .filter(|path| **path != closed)
             .find_map(|path| self.docs.iter().position(|doc| doc.path == *path))
-            .unwrap_or(0);
+        {
+            self.active = idx;
+        } else {
+            self.active = 0;
+            self.home = !self.docs.is_empty();
+        }
     }
 
     fn open_previous_file(&mut self) {
@@ -554,6 +590,7 @@ fn leaves_overlay(action: Action) -> bool {
             | Action::SearchInFiles
             | Action::RecentFiles
             | Action::Review
+            | Action::Database
             | Action::Shell
             | Action::AllKeys
             | Action::Quit

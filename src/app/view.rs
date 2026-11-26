@@ -47,10 +47,23 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(area);
-        if self.in_review
+        if self.in_review()
             && let Some(review) = &mut self.review
         {
             review.render(frame, top, body, &self.theme);
+        } else if self.in_db()
+            && let Some(view) = &mut self.database
+        {
+            if let Some(query) = view.render(frame, top, body, &self.theme)
+                && self.db_scratch.is_some()
+                && self.cur().map(|doc| &doc.path) == self.db_scratch.as_ref()
+            {
+                self.render_editor(frame, query);
+            }
+            // The view's own popups go over the query editor too.
+            if let Some(view) = &self.database {
+                view.render_popup(frame, body, &self.theme);
+            }
         } else {
             self.render_top(frame, top);
             self.render_editor(frame, body);
@@ -62,6 +75,9 @@ impl App {
 
     /// The current file with its decorations, or the welcome screen.
     fn render_editor(&mut self, frame: &mut Frame, body: Rect) {
+        // Popups at the caret (completion, documentation) need to know
+        // where the editor is: the whole body, or the query pane.
+        self.editor_area = body;
         let mut decorations = match &self.overlay {
             Overlay::Find(find) => find.decorations(),
             _ => Vec::new(),
@@ -82,6 +98,13 @@ impl App {
                 VirtualText::inline(pos.line, pos.col, "\u{25a0} ", ThemeRole::Muted)
             }));
         }
+        // In the Database view the query editor has the caret only while
+        // it has the focus.
+        let focused = matches!(self.overlay, Overlay::None)
+            && (!self.in_db()
+                || self.database.as_ref().is_some_and(|view| {
+                    view.focus == crate::database::Focus::Query && !view.has_popup()
+                }));
         let Some(doc) = visible(&mut self.docs, self.active, self.home) else {
             self.render_welcome(frame, body);
             return;
@@ -93,7 +116,7 @@ impl App {
         }
         let mut editor = Editor::new(&doc.buffer)
             .theme(&self.theme)
-            .focused(matches!(self.overlay, Overlay::None))
+            .focused(focused)
             .cell_caret(true)
             .diagnostics(&doc.diagnostics)
             .decorations(&decorations)
@@ -122,7 +145,10 @@ impl App {
                         .docs
                         .get(self.active)
                         .filter(|doc| !self.home && doc.path == completion.path)
-                        .and_then(|doc| doc.state.primary_caret_cell(body, &doc.buffer, &[]))
+                        .and_then(|doc| {
+                            doc.state
+                                .primary_caret_cell(self.editor_area, &doc.buffer, &[])
+                        })
                 {
                     completion.render(frame, body, caret, theme);
                 }
@@ -138,11 +164,23 @@ impl App {
             Overlay::Find(find) => render_find(frame, find_area, find, theme),
             Overlay::AllKeys(all_keys) => all_keys.render(frame, body, theme),
             Overlay::KeyCheck(key_check) => key_check.render(frame, body, theme),
+            Overlay::DbResult(grid) => render_db_result(frame, body, grid, theme),
+            Overlay::DbConfirm(sql) => {
+                let mut lines = vec![
+                    Line::styled(
+                        "This changes the database. Run it?",
+                        theme.style(ThemeRole::DiagnosticWarning),
+                    ),
+                    Line::raw(""),
+                ];
+                lines.extend(sql.lines().map(|line| Line::raw(line.to_string())));
+                crate::database::popup_box(frame, body, " Run SQL ", lines, theme);
+            }
             Overlay::Doc(text) => {
-                let caret = self
-                    .docs
-                    .get(self.active)
-                    .and_then(|doc| doc.state.primary_caret_cell(body, &doc.buffer, &[]));
+                let caret = self.docs.get(self.active).and_then(|doc| {
+                    doc.state
+                        .primary_caret_cell(self.editor_area, &doc.buffer, &[])
+                });
                 render_doc(frame, body, caret, text, theme);
             }
         }
@@ -151,7 +189,7 @@ impl App {
     /// The nano-style line of keys for whatever has focus right now.
     pub(super) fn hints(&self) -> Vec<(String, &'static str)> {
         let key = |action: Action| self.display_key(action);
-        if self.in_review
+        if self.in_review()
             && matches!(self.overlay, Overlay::None)
             && let Some(review) = &self.review
         {
@@ -163,6 +201,28 @@ impl App {
             shown.push((key(Action::Review), "Code"));
             return shown;
         }
+        if self.in_db()
+            && matches!(self.overlay, Overlay::None)
+            && let Some(view) = &self.database
+        {
+            let mut shown: Vec<(String, &'static str)> = view
+                .hints()
+                .into_iter()
+                .map(|(keys, label)| (keys.to_string(), label))
+                .collect();
+            if view.focus == crate::database::Focus::Query && !view.has_popup() {
+                shown.splice(
+                    0..0,
+                    [
+                        (key(Action::RunSql), "Run"),
+                        (key(Action::Complete), "Complete"),
+                        (key(Action::QuickDoc), "Docs"),
+                    ],
+                );
+            }
+            shown.push((key(Action::Database), "Code"));
+            return shown;
+        }
         if self.completion.is_some() && matches!(self.overlay, Overlay::None) {
             return vec![
                 hint("Enter", "Insert"),
@@ -172,6 +232,12 @@ impl App {
             ];
         }
         match &self.overlay {
+            Overlay::DbResult(_) => vec![
+                hint("Arrows", "Move"),
+                hint("y", "Copy value"),
+                hint("Esc", "Close"),
+            ],
+            Overlay::DbConfirm(_) => vec![hint("Enter", "Run it"), hint("Esc", "Cancel")],
             Overlay::Doc(_) => vec![hint("Esc", "Close"), hint("Any key", "Close and continue")],
             Overlay::KeyCheck(_) => vec![
                 hint("Esc", "Did not arrive"),
@@ -282,10 +348,22 @@ impl App {
         if any_problems {
             shown.push((key(Action::NextProblem), "Next problem"));
         }
+        if self.on_sql() {
+            // SQL has no definitions to jump to; it runs, completes and
+            // explains from the database instead.
+            shown.extend([
+                (key(Action::RunSql), "Run SQL"),
+                (key(Action::Complete), "Complete"),
+                (key(Action::QuickDoc), "Docs"),
+            ]);
+        } else {
+            shown.extend([
+                (key(Action::GotoDefinition), "Definition"),
+                (key(Action::FindUsages), "Usages"),
+            ]);
+        }
         shown.extend([
             (key(Action::Find), "Find"),
-            (key(Action::GotoDefinition), "Definition"),
-            (key(Action::FindUsages), "Usages"),
             (key(Action::RecentFiles), "Recent"),
             (key(Action::ToggleExplorer), "Tree"),
             (key(Action::Save), "Save"),
@@ -768,4 +846,31 @@ pub(crate) fn doc_lines(text: &str, theme: &Theme, inner_w: usize) -> Vec<Line<'
         lines.pop();
     }
     lines
+}
+
+/// Run SQL's result over the code: the lower part of the screen.
+fn render_db_result(
+    frame: &mut Frame,
+    body: Rect,
+    grid: &mut crate::database::grid::Grid,
+    theme: &Theme,
+) {
+    let height = (body.height * 2 / 5).max(6).min(body.height);
+    let area = Rect {
+        y: body.y + body.height.saturating_sub(height),
+        height,
+        ..body
+    };
+    frame.render_widget(Clear, area);
+    let first_line = grid.sql.lines().next().unwrap_or("").to_string();
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(format!(" {} ", grid.summary()))
+        .title(
+            Line::styled(format!(" {first_line} "), theme.style(ThemeRole::Muted)).right_aligned(),
+        )
+        .style(crate::styles::surface(theme));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    grid.render(frame, inner, theme, true);
 }

@@ -54,8 +54,9 @@ pub struct Completion {
     /// asked for a row of an older list never land on the new one.
     pub list: u64,
     pub path: PathBuf,
-    /// The server that answered, asked again to fill in the selected item.
-    pub client: crate::lsp::Server,
+    /// The server that answered, asked again to fill in the selected item;
+    /// `None` for candidates sanitty made itself (SQL from the schema).
+    pub client: Option<crate::lsp::Server>,
     /// Where the word being completed starts (chars). Typing narrows the list
     /// by the text from here to the caret.
     pub anchor: LineCol,
@@ -85,7 +86,7 @@ impl Completion {
     pub fn new(
         generation: u64,
         path: PathBuf,
-        client: crate::lsp::Server,
+        client: Option<crate::lsp::Server>,
         anchor: LineCol,
     ) -> Self {
         Self {

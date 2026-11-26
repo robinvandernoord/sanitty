@@ -11,15 +11,16 @@ sanitty is a non-modal IDE written in Rust that runs entirely in the terminal. J
 - Language servers provide definition and implementation jumps, usages, rename, problems, quick documentation, formatting and completion. Completion applies auto-imports when the server supplies them.
 - Tree-sitter syntax highlighting (edits reparse only what changed, except in TypeScript), rainbow columns for CSV and TSV, and colour swatches next to colour values in style files.
 - A Review view (`Alt+9`) for your uncommitted changes, this branch against main, one or more commits, or an open GitHub pull request (through `gh`): a side-by-side or inline diff in syntax colours, comments on lines and ranges, viewed marks, and the whole review copied to the clipboard as Markdown. Comments are kept between runs, outside the project.
+- A Database view (`Alt+8`) for PostgreSQL, MySQL/MariaDB and SQLite: connections found in `docker compose` (or set in `.sanitty/db.toml`), a schema tree, a query editor with completion (`Alt+J`) and documentation (`Alt+H`) from the schema, a result grid, and cell edits in any result that includes the table's primary key. Every statement that changes the database is shown and confirmed before it runs. `Alt+Enter` also runs the statement under the caret in any file, with the result in a popup.
 - Check Keys records which shortcuts reach sanitty.
 
 ## Status
 
-sanitty is an early personal project. The editor, language-server and review milestones are complete. The database view, multi-caret editing and a settings file are planned. See [PLAN.md](PLAN.md).
+sanitty is an early personal project. The editor, language-server, review and database milestones are complete. Multi-caret editing and a settings file are planned. See [PLAN.md](PLAN.md).
 
 ## Build and run
 
-You need Rust 1.92 or newer and a C compiler for the Tree-sitter parsers.
+You need Rust 1.94 or newer and a C compiler for the Tree-sitter parsers.
 
 ```sh
 git clone https://github.com/robinvandernoord/sanitty.git
@@ -50,6 +51,7 @@ In Recent Files, `Enter` opens the preselected previous file. Copy Line and Chec
 | | Go to Line | `Alt+G` |
 | | Recent Files | `Alt+E` |
 | | Review Changes | `Alt+9` |
+| | Database | `Alt+8` |
 | | Project Tree | `Alt+1` |
 | | Navigate Back | `Alt+,` |
 | | Navigate Forward | `Alt+.` |
@@ -69,6 +71,7 @@ In Recent Files, `Enter` opens the preselected previous file. Copy Line and Chec
 | | Toggle Line Comment | `Alt+/` |
 | | Reformat File | `Alt+L` |
 | | Code Completion | `Alt+J` |
+| | Run SQL | `Alt+Enter` |
 | Edit | Duplicate Line | `Alt+D` |
 | | Delete Line | `Alt+Y` |
 | | Undo | `Ctrl+Z` |
@@ -91,13 +94,29 @@ The default keys were tested in Ghostty and T3 Code's terminal. Launch sanitty w
 
 ## Configuration
 
-On Linux, sanitty uses `$XDG_CONFIG_HOME/sanitty`, with `~/.config/sanitty` as the default. Put a JSON colour theme in `theme.json` (the common editor theme format, with `colors` and `tokenColors`; unknown keys fall back to the built-in dark theme), or override shortcuts in `keymap.toml`. For example, to move Go to Definition from `Alt+B` to `F12`:
+On Linux, sanitty uses `$XDG_CONFIG_HOME/sanitty`, with `~/.config/sanitty` as the default. Override shortcuts in `keymap.toml`. For example, to move Go to Definition from `Alt+B` to `F12`:
 
 ```toml
 [bindings]
 "f12" = "goto-definition"
 "alt+b" = "none"
 ```
+
+The Database view finds PostgreSQL and MySQL/MariaDB services in `docker compose config` by their image or their `POSTGRES_*`, `MYSQL_*` and `MARIADB_*` variables. Override a service or add connections in `.sanitty/db.toml` in the project:
+
+```toml
+[connections.db]          # a compose service of that name: change its port
+port = 5433
+
+[connections.reports]
+url = "postgres://reader@reports.internal/reports"
+password_env = "REPORTS_PASSWORD"
+
+[connections.local]
+path = "db.sqlite3"       # SQLite, relative to the project
+```
+
+Queries are kept per connection in sanitty's state directory (`~/.local/state/sanitty/`), not in the project.
 
 Set `SANITTY_LOG` to a file path to record debug output, including language-server messages.
 

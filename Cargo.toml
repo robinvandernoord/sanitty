@@ -13,7 +13,7 @@ path = "src/main.rs"
 karet-core = "0.8.0"
 karet-text = "0.8.0"
 karet-editor = "0.8.0"
-karet-theme = { version = "0.8.0", features = ["view", "vscode"] }
+karet-theme = { version = "0.8.0", features = ["view"] }
 karet-syntax = { version = "0.8.0", features = [
     "lang-python", "lang-rust", "lang-typescript", "lang-javascript", "lang-json",
     "lang-toml", "lang-yaml", "lang-markdown", "lang-sql", "lang-html", "lang-css",
@@ -38,6 +38,12 @@ toml = "0.9"
 anyhow = "1"
 dirs = "6"
 karet-diff = "0.8.0"
+# Databases for the Database view. No compile-time macros: queries are typed
+# at runtime. rustls with the system's roots, for servers that require TLS.
+sqlx = { version = "0.9.1", default-features = false, features = [
+    "runtime-tokio", "postgres", "mysql", "sqlite-bundled", "tls-rustls-ring-native-roots",
+] }
+futures-util = { version = "0.3", default-features = false }
 
 # karet-lsp 0.8.0 with two fixes (see vendor/karet-lsp/SANITTY-PATCH.md).
 [patch.crates-io]

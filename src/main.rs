@@ -6,6 +6,7 @@ mod clipboard;
 mod colors;
 mod complete;
 mod csv;
+mod database;
 mod doc;
 mod explorer;
 mod find;
@@ -87,6 +88,18 @@ pub enum Event {
     ReviewChoices(Result<review::git::Choices, String>),
     /// A diff for the Review view, or why it could not be loaded.
     ReviewLoaded(Result<review::git::Loaded, String>),
+    /// Database connections found for the workspace, and problems finding them.
+    DbFound(Vec<database::conn::Connection>, Vec<String>),
+    /// A connection opened (with its schema) or failed, for the connect
+    /// with this generation.
+    DbConnected(
+        u64,
+        Result<(database::driver::Pool, database::driver::Schema), String>,
+    ),
+    /// The schema read again.
+    DbSchema(u64, Result<database::driver::Schema, String>),
+    /// SQL ran, for the run with this generation.
+    DbResult(u64, Result<database::driver::ResultSet, String>),
     Tick,
 }
 
@@ -177,10 +190,15 @@ fn spawn_input(tx: mpsc::UnboundedSender<Event>, paused: Arc<AtomicBool>) {
             }
             match event::poll(Duration::from_millis(30)) {
                 Ok(true) => {
-                    if let Ok(term_event) = event::read()
-                        && tx.send(Event::Term(term_event)).is_err()
-                    {
-                        return;
+                    if let Ok(term_event) = event::read() {
+                        // Exactly what the terminal sent, for finding out why
+                        // a key does nothing (SANITTY_LOG only).
+                        if let event::Event::Key(key) = &term_event {
+                            debug_log(&format!("key: {key:?}"));
+                        }
+                        if tx.send(Event::Term(term_event)).is_err() {
+                            return;
+                        }
                     }
                 }
                 Ok(false) => {}
