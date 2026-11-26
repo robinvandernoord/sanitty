@@ -50,7 +50,9 @@ never lost by switching.
 
 - Top bar, what you are looking at: file (with `*` when unsaved), its error and warning
   counts in colour (or "no problems"; a CSV file also shows the column under the
-  caret), other files with errors (else with warnings), running language servers.
+  caret), other files with errors (else with warnings), running language servers by
+  program (`ty ruff`; one still starting or failed by language: `python..`, `python
+  failed`).
 - Bottom, what is happening: the last message (it lasts one key press) or the problem
   under the caret, and the caret position.
 - Hint bar: the keys for whatever has focus.
@@ -208,8 +210,19 @@ here.
 
 ### Terminal
 
-`Alt+T` suspends sanitty and hands the terminal to `$SHELL` in the workspace root;
-exiting the shell returns. No embedded terminal for now.
+`Alt+T` opens the Terminal view: `$SHELL` running inside sanitty, in a pseudo-terminal
+in the workspace root (`TERM=xterm-256color`, `SANITTY=1`). It is a full-screen view like
+Review and Database, and the shell keeps running while you are elsewhere: `Alt+T` goes
+back to the view it was opened from, and again to the same session (a running server,
+the history, the scrollback). Every key but `Alt+T` goes to the shell, as an xterm would
+send it, so full-screen programs (vim, less, htop) work. `Shift+PageUp`/`PageDown` scroll
+back through 5000 lines. When the shell exits, Enter starts a new one. Quitting sanitty
+while a program runs in the shell's foreground (a server, `cargo watch`, vim) warns
+first, as unsaved changes do ("Still running in the terminal: cargo. Press quit again
+to stop it."); an idle shell at its prompt does not.
+
+Built on `portable-pty` (the pseudo-terminal), `vt100` (the screen and scrollback) and
+`tui-term` (drawing it).
 
 ## Finding your way
 
@@ -304,7 +317,7 @@ key check (`sanitty --check-keys`, 2026-11-19).
 | Save                     | `Ctrl+S`         |
 | Close file               | `Alt+W`          |
 | All keys                 | `F1`             |
-| Shell                    | `Alt+T`          |
+| Terminal view (and back) | `Alt+T`          |
 | Quit                     | `Alt+Q`          |
 
 Copy Line and Check Keys have no key; they are in the launcher. Find Action is not a
@@ -354,7 +367,10 @@ One Rust binary.
   TypeScript 7's own server (`tsc --lsp --stdio`, the project's `node_modules` first,
   else the `tsc` on PATH, e.g. from `bun i -g typescript`), with
   typescript-language-server as the fallback for older TypeScript (pointed at a global
-  `tsserver.js` when the project has none). No `package.json` is needed. Servers run on the host with the project's own venv.
+  `tsserver.js` when the project has none). No `package.json` is needed. Servers run on the host with the project's own venv: a Python server (and ruff) installed in it
+  (`VIRTUAL_ENV`, else `.venv` or `venv` in the workspace) wins over one on PATH, and either runs with
+  that venv activated (`VIRTUAL_ENV` set, its `bin` first on PATH), so imports resolve to the project's
+  packages.
 - `karet-diff` (with its `view` feature) and `karet-vcs`: diffs and git facts.
 - `sqlx`: databases.
 - Own code: views, popups, keymap, config, review model, compose discovery.

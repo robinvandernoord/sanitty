@@ -18,6 +18,7 @@ mod picker;
 mod review;
 mod search;
 mod settings;
+mod shell;
 mod sig;
 mod statefile;
 mod stylenav;
@@ -29,8 +30,6 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crossterm::event;
@@ -51,7 +50,8 @@ pub enum Event {
     Term(event::Event),
     Files(Vec<PathBuf>),
     Status(String),
-    LspReady(&'static str, Arc<LspClient>),
+    /// A language server started: its key, the program it is, the client.
+    LspReady(&'static str, String, Arc<LspClient>),
     LspFailed(&'static str, String),
     /// Problems for a file from one server (its key), replacing that server's last report.
     /// The document version it describes, when known, so an older report
@@ -83,6 +83,8 @@ pub enum Event {
     ),
     /// Semantic tokens for a file at an LSP document version (UTF-16 columns).
     Semantic(PathBuf, i32, Vec<karet_core::SemanticToken>),
+    /// The Terminal view's shell printed something or exited: redraw.
+    ShellOutput,
     /// Async launcher results: search generation, kind, items.
     Launcher(u64, picker::Kind, Vec<picker::Item>),
     /// The sources the Review view can show, for its picker.
@@ -182,15 +184,10 @@ fn index_files(root: PathBuf, tx: mpsc::UnboundedSender<Event>) {
     });
 }
 
-/// Reads terminal input on its own thread. `paused` stops it while a child
-/// shell owns the terminal, so no keystrokes are stolen from it.
-fn spawn_input(tx: mpsc::UnboundedSender<Event>, paused: Arc<AtomicBool>) {
+/// Reads terminal input on its own thread.
+fn spawn_input(tx: mpsc::UnboundedSender<Event>) {
     std::thread::spawn(move || {
         loop {
-            if paused.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(20));
-                continue;
-            }
             match event::poll(Duration::from_millis(30)) {
                 Ok(true) => {
                     if let Ok(term_event) = event::read() {
@@ -240,33 +237,60 @@ fn leave_terminal(enhanced: bool) {
     let _ = terminal::disable_raw_mode();
 }
 
-/// Hand the terminal to `$SHELL` in the workspace root until it exits.
-fn run_shell(root: &Path, enhanced: bool, paused: &AtomicBool) {
-    paused.store(true, Ordering::Release);
-    std::thread::sleep(Duration::from_millis(60));
-    leave_terminal(enhanced);
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    println!("sanitty: {shell} in {} (exit to return)", root.display());
-    let _ = std::process::Command::new(shell)
-        .current_dir(root)
-        .env("SANITTY", "1")
-        .status();
-    let _ = enter_terminal(enhanced);
-    paused.store(false, Ordering::Release);
+/// What to open, from the arguments: a path (the current directory when
+/// none), or `z <words>` for the directory zoxide knows by those words, as
+/// `z` itself would go to. `z` only means zoxide when nothing called `z`
+/// is here.
+fn target(args: &[String]) -> Result<PathBuf, String> {
+    match args {
+        [] => Ok(PathBuf::from(".")),
+        [first, words @ ..] if first == "z" && !Path::new("z").exists() => zoxide(words),
+        [first, ..] => Ok(PathBuf::from(first)),
+    }
+}
+
+/// The directory zoxide picks for `words` (`zoxide query`).
+fn zoxide(words: &[String]) -> Result<PathBuf, String> {
+    if words.is_empty() {
+        return Err("z needs words to look for, e.g. `sanitty z project`".into());
+    }
+    let output = std::process::Command::new("zoxide")
+        .arg("query")
+        .arg("--")
+        .args(words)
+        .output()
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => "zoxide is not installed (or not on PATH)".to_string(),
+            _ => format!("could not run zoxide: {err}"),
+        })?;
+    let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || found.is_empty() {
+        return Err(format!(
+            "zoxide knows no directory for \"{}\"",
+            words.join(" ")
+        ));
+    }
+    Ok(PathBuf::from(found))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // `--check-keys` starts in Check Keys, for terminals that swallow the launcher key.
     let check_keys = std::env::args().any(|arg| arg == "--check-keys");
-    let arg = std::env::args()
+    let positional: Vec<String> = std::env::args()
         .skip(1)
-        .find(|arg| !arg.starts_with("--"))
-        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        .filter(|arg| !arg.starts_with("--"))
+        .collect();
+    let arg = match target(&positional) {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("sanitty: {message}");
+            std::process::exit(1);
+        }
+    };
     let root = workspace_root(&arg);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let paused = Arc::new(AtomicBool::new(false));
 
     enter_terminal(false)?;
     let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -295,7 +319,7 @@ async fn main() -> anyhow::Result<()> {
         app.show_tree();
     }
     index_files(root.clone(), tx.clone());
-    spawn_input(tx.clone(), paused.clone());
+    spawn_input(tx.clone());
     let tick_tx = tx.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(300));
@@ -318,13 +342,8 @@ async fn main() -> anyhow::Result<()> {
             while let Ok(queued) = rx.try_recv() {
                 app.handle(queued);
             }
-            match app.request.take() {
-                Some(app::Request::Shell) => {
-                    run_shell(&app.root, enhanced, &paused);
-                    term.clear()?;
-                }
-                Some(app::Request::Quit) => break,
-                None => {}
+            if app.request.take() == Some(app::Request::Quit) {
+                break;
             }
         }
         Ok(())

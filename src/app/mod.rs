@@ -33,6 +33,7 @@ mod database;
 mod input;
 mod navigate;
 mod review;
+mod terminal;
 mod view;
 
 pub(crate) use view::doc_lines;
@@ -71,14 +72,13 @@ enum Screen {
     Code,
     Review,
     Database,
+    Terminal,
 }
 
 /// Something the app asks the main loop to do after handling an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
     Quit,
-    /// Suspend into a shell (Alt+T) and come back.
-    Shell,
 }
 
 pub struct App {
@@ -148,6 +148,10 @@ pub struct App {
     db_return: Option<(Option<PathBuf>, bool)>,
     /// The query editor's file, once connected.
     db_scratch: Option<PathBuf>,
+    /// The Terminal view's shell, kept running while it is off screen.
+    shell: Option<crate::shell::Shell>,
+    /// The view the Terminal view was opened from, to go back to.
+    terminal_return: Screen,
     /// Where the last jump (definition, usages, implementation) was asked
     /// from: its answer only counts while the caret is still there.
     nav_asked: Option<(PathBuf, LineCol)>,
@@ -204,6 +208,8 @@ impl App {
             db_scratch: None,
             editor_area: ratatui::layout::Rect::default(),
             nav_asked: None,
+            shell: None,
+            terminal_return: Screen::Code,
             enhanced_keys: false,
         }
     }
@@ -258,7 +264,9 @@ impl App {
             Event::CompletionResolved(list, index, item) => {
                 self.on_completion_resolved(list, index, item);
             }
-            Event::Term(_) => {}
+            // Other terminal events, and the shell printing something (or
+            // exiting): nothing to do, the next draw shows it.
+            Event::Term(_) | Event::ShellOutput => {}
             Event::Files(files) => {
                 self.files = files;
                 let items = self.file_items();
@@ -269,7 +277,7 @@ impl App {
                 }
             }
             Event::Status(text) => self.status = text,
-            Event::LspReady(key, client) => self.on_lsp_ready(key, client),
+            Event::LspReady(key, program, client) => self.on_lsp_ready(key, program, client),
             Event::LspFailed(key, msg) => {
                 if !msg.is_empty() {
                     self.status.clone_from(&msg);

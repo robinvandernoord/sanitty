@@ -12,6 +12,7 @@ sanitty is a non-modal IDE written in Rust that runs entirely in the terminal. J
 - Tree-sitter syntax highlighting (edits reparse only what changed, except in TypeScript), rainbow columns for CSV and TSV, and colour swatches next to colour values in style files.
 - A Review view (`Alt+9`) for your uncommitted changes, this branch against main, one or more commits, or an open GitHub pull request (through `gh`): a side-by-side or inline diff in syntax colours, comments on lines and ranges, viewed marks, and the whole review copied to the clipboard as Markdown. Comments are kept between runs, outside the project.
 - A Database view (`Alt+8`) for PostgreSQL, MySQL/MariaDB and SQLite: connections found in `docker compose` (or set in `.sanitty/db.toml`), a schema tree, a query editor with completion (`Alt+J`) and documentation (`Alt+H`) from the schema, a result grid, and cell edits in any result that includes the table's primary key. Every statement that changes the database is shown and confirmed before it runs. `Alt+Enter` also runs the statement under the caret in any file, with the result in a popup.
+- A Terminal view (`Alt+T`): your shell running inside sanitty, in the project root. It keeps running while you are back in the code, so `Alt+T` returns to the same session.
 - Multi-caret editing: add carets above and below, at the next or every occurrence of a word, or at the ends of selected lines, then type, delete, paste or comment at all of them as one undo step.
 - Check Keys records which shortcuts reach sanitty.
 
@@ -56,6 +57,7 @@ cargo install sanitty
 
 ```sh
 sanitty /path/to/project
+sanitty z project        # the directory zoxide knows as "project", like `z project`
 ```
 
 Pass a directory to open it as the workspace, or a file to open that file. With no path, sanitty starts in the current directory. Inside a Git checkout, the workspace is the whole repository. Press `F1` to see every action and its key.
@@ -64,7 +66,7 @@ Language servers are optional and installed separately on the machine running sa
 
 | Language | Server |
 | --- | --- |
-| Python | `ty` (`uv tool install ty`), plus `ruff` (`uv tool install ruff`) for lint warnings and formatting. When `ty` is not installed, sanitty uses the first of `basedpyright-langserver`, `pyright-langserver` and `pylsp` it finds. `settings.toml` can prefer another server or turn ruff off. |
+| Python | `ty`, plus `ruff` for lint warnings and formatting: installed in the project (`uv add --dev ty ruff`) or for your user (`uv tool install ty`). sanitty looks in the project's venv (`VIRTUAL_ENV`, else `.venv` or `venv` in the project) first, then on `PATH`, and runs the server in that venv either way, so it sees the project's dependencies. When `ty` is not installed, sanitty uses the first of `basedpyright-langserver`, `pyright-langserver` and `pylsp` it finds. `settings.toml` can prefer another server or turn ruff off. |
 | Rust | `rust-analyzer` (`rustup component add rust-analyzer`). |
 | TypeScript and JavaScript | TypeScript 7 or newer: `node_modules/.bin/tsc` in the workspace (`npm install -D typescript@7`), else `tsc` on `PATH`. Older TypeScript works through `typescript-language-server` on `PATH`. |
 
@@ -117,7 +119,7 @@ In Recent Files, `Enter` opens the preselected previous file. Copy Line and Chec
 | File | Save | `Ctrl+S` |
 | | Close File | `Alt+W` |
 | App | All Keys | `F1` |
-| | Shell | `Alt+T` |
+| | Terminal | `Alt+T` |
 | | Quit | `Alt+Q` |
 
 With no selection, `Ctrl+C` returns from a file to the project tree. From the home screen it quits, asking first when files have unsaved changes. To paste text from outside sanitty, use your terminal's own paste shortcut.

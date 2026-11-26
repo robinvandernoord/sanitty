@@ -54,6 +54,11 @@ sqlx = { version = "0.9.1", default-features = false, features = [
     "runtime-tokio", "postgres", "mysql", "sqlite-bundled", "tls-rustls-ring-native-roots",
 ] }
 futures-util = { version = "0.3", default-features = false }
+# The Terminal view: the shell in a pseudo-terminal, its screen kept by vt100
+# (the version tui-term draws) and drawn by tui-term.
+portable-pty = "0.9"
+vt100 = "0.16"
+tui-term = "0.3.4"
 
 # One static binary per architecture is shipped as is: stripped, and linked
 # across crates for size.

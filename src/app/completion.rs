@@ -48,7 +48,7 @@ impl App {
             .map(|(_, client)| client)
             .collect();
         if servers.is_empty() {
-            self.status = "The language server is not running yet".into();
+            self.status = self.lsp.unavailable(lang, &self.root, &self.tx);
             return;
         }
         let Some(client) = servers

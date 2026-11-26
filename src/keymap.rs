@@ -169,7 +169,11 @@ impl Action {
             "Check Keys (which keys reach sanitty)",
             "App",
         ),
-        (Action::Shell, "Shell (suspend to $SHELL)", "App"),
+        (
+            Action::Shell,
+            "Terminal (your shell, inside sanitty)",
+            "App",
+        ),
         (Action::Quit, "Quit", "App"),
     ];
 
@@ -225,7 +229,7 @@ impl Action {
             Action::CloseFile => "close file tab buffer",
             Action::NavBack => "back history previous location",
             Action::NavForward => "forward history next location",
-            Action::Shell => "shell terminal bash console",
+            Action::Shell => "shell terminal bash zsh console command line",
             Action::Quit => "quit exit",
             Action::None => "",
         }

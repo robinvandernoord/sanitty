@@ -35,6 +35,9 @@ use super::visible;
 
 impl App {
     pub(super) fn on_paste(&mut self, text: &str) {
+        if self.terminal_paste(text) {
+            return;
+        }
         if self.db_paste(text) {
             return;
         }
@@ -77,6 +80,9 @@ impl App {
         self.status.clear();
         self.armed = self.confirm.take();
         let action = self.keymap.lookup(&key);
+        if self.terminal_key(&key, action) {
+            return;
+        }
         if self.review_key(&key, action) {
             return;
         }
@@ -401,7 +407,7 @@ impl App {
                     self.open(&path, Some(pos));
                 }
             }
-            Action::Shell => self.request = Some(Request::Shell),
+            Action::Shell => self.toggle_terminal(),
         }
     }
 
@@ -440,15 +446,26 @@ impl App {
             .filter(|doc| doc.buffer.is_dirty())
             .map(|doc| self.rel(&doc.path).display().to_string())
             .collect();
-        if dirty.is_empty() || self.armed == Some(Action::Quit) {
+        // A program still running in the Terminal view would be stopped.
+        let running = self.shell.as_ref().and_then(crate::shell::Shell::running);
+        if (dirty.is_empty() && running.is_none()) || self.armed == Some(Action::Quit) {
             self.request = Some(Request::Quit);
-        } else {
-            self.status = format!(
-                "Unsaved: {}. Press quit again to discard.",
-                dirty.join(", ")
-            );
-            self.confirm = Some(Action::Quit);
+            return;
         }
+        let mut parts = Vec::new();
+        if !dirty.is_empty() {
+            parts.push(format!("Unsaved: {}", dirty.join(", ")));
+        }
+        if let Some(program) = &running {
+            parts.push(format!("Still running in the terminal: {program}"));
+        }
+        let what = match (dirty.is_empty(), running.is_none()) {
+            (false, true) => "discard",
+            (true, false) => "stop it",
+            _ => "discard and stop it",
+        };
+        self.status = format!("{}. Press quit again to {what}.", parts.join(". "));
+        self.confirm = Some(Action::Quit);
     }
 
     fn search_in_files(&mut self) {

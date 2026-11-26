@@ -159,11 +159,16 @@ impl App {
             .collect()
     }
 
-    pub(super) fn on_lsp_ready(&mut self, key: &'static str, client: Arc<LspClient>) {
+    pub(super) fn on_lsp_ready(
+        &mut self,
+        key: &'static str,
+        program: String,
+        client: Arc<LspClient>,
+    ) {
         // Servers already running get the edits they have not seen yet
         // first; the new server then opens every document as it is now.
         self.sync_lsp();
-        let server = self.lsp.ready(key, client);
+        let server = self.lsp.ready(key, program, client);
         for doc in &mut self.docs {
             if let Some(lang) = doc.lsp_lang.filter(|lang| lsp::Hub::is_key(lang, key)) {
                 lsp::did_open(
@@ -232,9 +237,15 @@ impl App {
         let Some(doc) = self.cur() else {
             return;
         };
-        let Some(client) = doc.lsp_lang.and_then(|lang| self.lsp.client(lang)) else {
+        let lang = doc.lsp_lang;
+        let Some(client) = lang.and_then(|lang| self.lsp.client(lang)) else {
+            // Only when asked (Alt+H): the type in the bottom line asks on
+            // every rest of the caret, which must not retry each time.
             if popup {
-                self.status = "No language server for this file".into();
+                self.status = match lang {
+                    Some(lang) => self.lsp.unavailable(lang, &self.root, &self.tx),
+                    None => "No language server for this file type".into(),
+                };
             }
             return;
         };
@@ -268,10 +279,7 @@ impl App {
             return;
         };
         let Some(client) = self.lsp.client(lang) else {
-            self.status = format!(
-                "Language server for {lang} is not running ({})",
-                self.lsp.status()
-            );
+            self.status = self.lsp.unavailable(lang, &self.root, &self.tx);
             return;
         };
         let (path, caret16) = (doc.path.clone(), doc.caret_utf16());
@@ -367,7 +375,7 @@ impl App {
         };
         let servers = self.lsp.running(lang);
         if servers.is_empty() {
-            self.status = "The language server is not running yet".into();
+            self.status = self.lsp.unavailable(lang, &self.root, &self.tx);
             return;
         }
         let indentation = karet_lsp::Indentation {

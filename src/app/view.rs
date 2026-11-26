@@ -48,6 +48,12 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(area);
+        if self.screen == super::Screen::Terminal {
+            self.render_terminal(frame, top, body, status);
+            self.render_hints(frame, hints);
+            self.render_overlay(frame, body, find_area);
+            return;
+        }
         if self.in_review()
             && let Some(review) = &mut self.review
         {
@@ -72,6 +78,43 @@ impl App {
         self.render_status(frame, status);
         self.render_hints(frame, hints);
         self.render_overlay(frame, body, find_area);
+    }
+
+    /// The Terminal view: a title, and the shell in the rest. The status
+    /// line is the shell's too unless there is a message to show.
+    fn render_terminal(&mut self, frame: &mut Frame, top: Rect, body: Rect, status: Rect) {
+        let program = self
+            .shell
+            .as_ref()
+            .map_or_else(String::new, |shell| shell.program.clone());
+        let title = format!(" Terminal   {}   {program}", self.root.display());
+        frame.render_widget(
+            Paragraph::new(title).style(crate::styles::bar(&self.theme)),
+            top,
+        );
+        let area = if self.status.is_empty() {
+            Rect {
+                height: body.height + status.height,
+                ..body
+            }
+        } else {
+            frame.render_widget(
+                Paragraph::new(format!(" {}", self.status))
+                    .style(crate::styles::surface(&self.theme)),
+                status,
+            );
+            body
+        };
+        match &mut self.shell {
+            Some(shell) => shell.render(frame, area, &self.theme),
+            None => frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "  No shell is running. Enter starts one.",
+                    self.theme.style(ThemeRole::Muted),
+                )),
+                area,
+            ),
+        }
     }
 
     /// The current file with its decorations, or the welcome screen.
@@ -179,6 +222,15 @@ impl App {
 
     /// The nano-style line of keys for whatever has focus right now.
     pub(super) fn hints(&self) -> Vec<(String, &'static str)> {
+        if self.screen == super::Screen::Terminal && matches!(self.overlay, Overlay::None) {
+            self.terminal_hints()
+        } else {
+            self.view_hints()
+        }
+    }
+
+    /// The hint bar for the code, Review and Database views and popups.
+    fn view_hints(&self) -> Vec<(String, &'static str)> {
         let key = |action: Action| self.display_key(action);
         if self.in_review()
             && matches!(self.overlay, Overlay::None)
