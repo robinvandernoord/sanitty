@@ -237,6 +237,7 @@ impl Doc {
         } else {
             self.state.place_caret(caret);
         }
+        self.note_carets();
         self.state.reveal(&self.buffer, caret);
         self.rehighlight(&applied.edits);
         true
@@ -304,6 +305,7 @@ impl Doc {
             return false;
         };
         self.state.set_cursor_state(&self.buffer, multi.cursors);
+        self.note_carets();
         self.state.reveal(&self.buffer, self.caret());
         self.rehighlight(&applied.edits);
         true
@@ -360,11 +362,13 @@ impl Doc {
                     editing::map_selection(*selection, &change.edits)
                 });
             self.keep_others(&before, &change.edits, primary);
+            self.note_carets();
             self.rehighlight(&applied.edits);
             return true;
         }
         let clamped = self.buffer.clamp(caret);
         self.state.place_caret(clamped);
+        self.note_carets();
         self.rehighlight(&applied.edits);
         true
     }
@@ -671,16 +675,24 @@ impl Doc {
         }
     }
 
+    /// Redo the last undone step and put every caret back where that step
+    /// left it (several carets stay several).
     pub fn redo(&mut self) {
         if let Some(applied) = self.buffer.redo() {
-            if let Some(cursors) = applied.restored_cursor {
-                self.state.set_cursor_state(&self.buffer, cursors);
-            }
-            let clamped = self.buffer.clamp(self.caret());
-            self.state.place_caret(clamped);
-            self.state.reveal(&self.buffer, clamped);
+            // Without a recorded state the carets stay, kept inside the text.
+            let cursors = applied
+                .restored_cursor
+                .unwrap_or_else(|| self.state.cursors().clone());
+            self.state.set_cursor_state(&self.buffer, cursors);
             self.rehighlight(&applied.edits);
         }
+    }
+
+    /// Tell the buffer where the carets are right after an edit, so redoing
+    /// it puts them back there (undo already knows where they were before).
+    fn note_carets(&mut self) {
+        let cursors = self.state.cursors().clone();
+        self.buffer.note_cursor_after(&cursors);
     }
 
     /// The selected text; with several selections, each on its own line.
@@ -896,6 +908,21 @@ mod tests {
         doc.undo();
         assert_eq!(doc.buffer.text(), "one\ntwo\nthree\n");
         assert_eq!(doc.state.cursors().selections.len(), 3);
+        // Redo brings the text back and keeps all three carets, after it.
+        doc.redo();
+        assert_eq!(doc.buffer.text(), "-one\n-two\n-three\n");
+        let heads: Vec<LineCol> = doc
+            .state
+            .cursors()
+            .selections
+            .iter()
+            .map(|selection| selection.head)
+            .collect();
+        assert_eq!(
+            heads,
+            [LineCol::new(0, 1), LineCol::new(1, 1), LineCol::new(2, 1)]
+        );
+        doc.undo();
 
         // As many lines as carets: one each.
         doc.paste_each("a\nb\nc\n");
