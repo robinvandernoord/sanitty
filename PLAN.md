@@ -123,7 +123,11 @@ here.
   comment stays on its line while that line's text is still in the diff.
 - State lives outside the project, in `~/.local/state/sanitty/`, one file per
   repository (both sources, and which one was used last), so nothing shows up in the
-  repo.
+  repo. Its name holds a fixed hash of the repository path (FNV-1a, the same in every
+  build; state under the names earlier builds used is moved over). It is written in one
+  step, merged with what another sanitty on the same repository wrote meanwhile (both
+  keep their comments, deletions stay deleted), and a file that cannot be read is kept
+  aside as `...broken-<time>.json` with a message instead of being replaced.
 
 ### Database view
 
@@ -179,8 +183,19 @@ here.
   when the server says the column is a table's (renamed columns too, computed ones not)
   and that table's primary key is in the result as well; otherwise Enter says what is
   missing. Enter edits the cell (Tab makes it NULL), the generated
-  `UPDATE ... WHERE pk = ...` is shown first, and the query runs again after. DDL reads
-  the schema again.
+  `UPDATE ... WHERE pk = ...` is shown first, and the query runs again after (only when
+  it only reads; a write never runs again by itself, and `r` asks first). DDL reads the
+  schema again.
+- What counts as a read is decided per engine: a backslash escapes a quote only in MySQL
+  and Postgres `E'...'` strings, MySQL's `/*! ... */` is code, not a comment, and a SQLite
+  `PRAGMA` with an argument only reads when it is one that reports (`table_info`, ...).
+- A cell edit changes one row or nothing: its `UPDATE` runs in a transaction that is undone
+  unless exactly one row changed. It is refused up front when a key value is NULL, when
+  the table appears more than once in the query (a self-join: the server names the table,
+  not which use of it), or when a key column is in the result twice.
+- The confirmation box shows all of the SQL: long batches scroll, and Enter only runs it
+  once every line has been on screen. Only a plain Enter or `y` confirms (Alt+Y, Delete
+  Line, does nothing there). The Database view and Run SQL over the code share it.
 - From the Code view, `Alt+Enter` in any file runs the selection (or the statement under
   the caret) against the active connection and shows the grid in a bottom popup (writes are
   confirmed first). Without a connection it says so; `Alt+8` makes one.
