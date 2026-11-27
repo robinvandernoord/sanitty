@@ -11,7 +11,7 @@ readme = "README.md"
 keywords = ["ide", "editor", "terminal", "tui", "lsp"]
 categories = ["command-line-utilities", "text-editors", "development-tools"]
 # CI workflows are for the repository, not the crate.
-exclude = [".github/"]
+exclude = [".github/", "site/"]
 
 [[bin]]
 name = "sanitty"
