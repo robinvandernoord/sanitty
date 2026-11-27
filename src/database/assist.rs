@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use karet_core::CompletionItems;
+use karet_core::CompletionItem;
 use karet_core::CompletionKind;
 use karet_core::Markup;
 use karet_core::MarkupKind;
