@@ -70,6 +70,22 @@ Language servers are optional and installed separately on the machine running sa
 | Rust | `rust-analyzer` (`rustup component add rust-analyzer`). |
 | TypeScript and JavaScript | TypeScript 7 or newer: `node_modules/.bin/tsc` in the workspace (`npm install -D typescript@7`), else `tsc` on `PATH`. Older TypeScript works through `typescript-language-server` on `PATH`. |
 
+Other languages need one section in `settings.toml` per server:
+
+```toml
+[lsp.go]
+command = "gopls"         # a program on PATH, or a path
+extensions = ["go"]       # the files it serves
+install = "`go install golang.org/x/tools/gopls@latest`"   # shown when it is missing
+# args = []               # its arguments
+# label = "Go"            # its name in messages (default: the section name)
+# language_id = "go"      # the language id the server is sent (default: the section name)
+# linter = true           # problems only, alongside the language's main server
+# [lsp.go.init_options]   # the server's initializationOptions
+```
+
+A section named `python`, `ruff`, `rust` or `ts` changes that built-in server: `enabled = false` turns it off, and `command` replaces how sanitty finds it (for Python, that also skips the venv lookup). The top bar shows when a language's server is missing or failed, rather than "no problems".
+
 ## Default keys
 
 In Recent Files, `Enter` opens the preselected previous file. Copy Line and Check Keys are available in Search Everywhere.

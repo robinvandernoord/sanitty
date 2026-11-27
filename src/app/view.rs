@@ -456,7 +456,6 @@ impl App {
         let style = crate::styles::bar(&self.theme);
         let err = self.theme.style(ThemeRole::DiagnosticError);
         let warn = self.theme.style(ThemeRole::DiagnosticWarning);
-        let clean = self.theme.token_style(karet_core::TokenId::STRING);
         let muted = self.theme.style(ThemeRole::Muted);
         let mut left: Vec<Span> = Vec::new();
         let current = self.cur();
@@ -477,32 +476,7 @@ impl App {
                         style.add_modifier(Modifier::BOLD),
                     ));
                 }
-                // Files something checks: a language server, or the CSV checker.
-                if doc.lsp_lang.is_some() || doc.table.is_some() {
-                    let count_of = |sev| {
-                        doc.diagnostics
-                            .iter()
-                            .filter(|diag| diag.severity == sev)
-                            .count()
-                    };
-                    let (errs, warns) = (count_of(Severity::Error), count_of(Severity::Warning));
-                    if errs + warns == 0 {
-                        left.push(Span::styled("no problems   ", clean));
-                    }
-                    if errs > 0 {
-                        left.push(Span::styled(
-                            format!("{errs} {}  ", plural(errs, "error")),
-                            err.add_modifier(Modifier::BOLD),
-                        ));
-                    }
-                    if warns > 0 {
-                        left.push(Span::styled(
-                            format!("{warns} {}  ", plural(warns, "warning")),
-                            warn,
-                        ));
-                    }
-                    left.push(Span::raw(" "));
-                }
+                self.push_problems(doc, &mut left);
             }
             None => left.push(Span::styled(
                 format!(" {}   ", self.root.display()),
@@ -550,6 +524,63 @@ impl App {
         left.push(Span::raw(" ".repeat(pad)));
         left.push(Span::styled(right, muted));
         frame.render_widget(Paragraph::new(Line::from(left)).style(style), area);
+    }
+
+    /// The current file's problem count, or why there is none: "no problems"
+    /// only once something has actually checked the file (the CSV checker
+    /// always has; a language server once it sent a report for it).
+    fn push_problems(&self, doc: &crate::doc::Doc, left: &mut Vec<Span<'static>>) {
+        // Files something checks: a language server, or the CSV checker.
+        if doc.lsp_lang.is_none() && doc.table.is_none() {
+            return;
+        }
+        let err = self.theme.style(ThemeRole::DiagnosticError);
+        let warn = self.theme.style(ThemeRole::DiagnosticWarning);
+        let clean = self.theme.token_style(karet_core::TokenId::STRING);
+        let muted = self.theme.style(ThemeRole::Muted);
+        let count_of = |sev| {
+            doc.diagnostics
+                .iter()
+                .filter(|diag| diag.severity == sev)
+                .count()
+        };
+        let (errs, warns) = (count_of(Severity::Error), count_of(Severity::Warning));
+        let reported = doc.table.is_some()
+            || self
+                .problem_parts
+                .get(&doc.path)
+                .is_some_and(|parts| !parts.is_empty());
+        let health = doc
+            .lsp_lang
+            .and_then(|lang| Some((crate::lsp::server_label(lang), self.lsp.health(lang)?)));
+        if errs + warns == 0 {
+            use crate::lsp::Health;
+            match health {
+                _ if reported => {
+                    left.push(Span::styled("no problems   ", clean));
+                }
+                Some((name, Health::Missing)) => {
+                    left.push(Span::styled(format!("no {name} server   "), err));
+                }
+                Some((name, Health::Failed)) => {
+                    left.push(Span::styled(format!("{name} server failed   "), err));
+                }
+                _ => left.push(Span::styled("checking…   ", muted)),
+            }
+        }
+        if errs > 0 {
+            left.push(Span::styled(
+                format!("{errs} {}  ", plural(errs, "error")),
+                err.add_modifier(Modifier::BOLD),
+            ));
+        }
+        if warns > 0 {
+            left.push(Span::styled(
+                format!("{warns} {}  ", plural(warns, "warning")),
+                warn,
+            ));
+        }
+        left.push(Span::raw(" "));
     }
 
     /// The bottom status line: what is happening. The message (or the problem

@@ -833,15 +833,7 @@ fn syntax_language(path: &Path) -> Option<LanguageId> {
 
 /// The LSP language id for a path, by extension.
 pub fn lsp_language(path: &Path) -> Option<&'static str> {
-    Some(match path.extension()?.to_str()? {
-        "py" | "pyi" => "python",
-        "rs" => "rust",
-        "ts" | "mts" | "cts" => "typescript",
-        "tsx" => "typescriptreact",
-        "js" | "mjs" | "cjs" => "javascript",
-        "jsx" => "javascriptreact",
-        _ => return None,
-    })
+    crate::lsp::registry().language(path.extension()?.to_str()?)
 }
 
 fn comment_prefix(path: &Path) -> Option<&'static str> {

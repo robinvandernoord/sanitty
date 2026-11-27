@@ -12,21 +12,45 @@
 //! [database]
 //! table_rows = 500      # rows when opening a table from the tree
 //! max_rows = 10000      # rows a result keeps
+//!
+//! [lsp.go]              # add or change a language server; see `lsp::registry`
+//! command = "gopls"
+//! extensions = ["go"]
 //! ```
 //!
 //! A file that does not parse, or a value out of range, is reported and
 //! the defaults stay: a typo never stops sanitty.
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub editor: Editor,
     pub python: Python,
     pub database: Database,
+    /// Language servers added or changed, by name.
+    pub lsp: BTreeMap<String, LspEntry>,
+}
+
+/// An `[lsp.<name>]` section; every field is optional here, and what a
+/// server needs is checked when the registry is built (`lsp::registry`).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LspEntry {
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub extensions: Option<Vec<String>>,
+    pub label: Option<String>,
+    pub language_id: Option<String>,
+    pub language_ids: BTreeMap<String, String>,
+    pub linter: Option<bool>,
+    pub enabled: Option<bool>,
+    pub install: Option<String>,
+    pub init_options: Option<toml::Table>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -157,6 +181,7 @@ impl Settings {
             1..=1_000_000,
             defaults.database.max_rows,
         );
+        problems.extend(crate::lsp::Registry::build(&settings).1);
         (settings, problems)
     }
 }

@@ -1,8 +1,14 @@
 //! Language servers, started lazily the first time a file of their language
 //! opens: one main server per language (hover, navigation, colours, problems)
-//! plus, for Python, ruff as a linter (problems only). All requests run on tokio
-//! tasks and report back to the app loop as [`Event`]s, so the UI never blocks
-//! on a server.
+//! plus linters (problems only), such as ruff for Python. Which servers exist
+//! is in [`registry`]. All requests run on tokio tasks and report back to the
+//! app loop as [`Event`]s, so the UI never blocks on a server.
+
+mod registry;
+
+pub use registry::Registry;
+use registry::Resolver;
+pub use registry::registry;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -161,6 +167,41 @@ impl Server {
     }
 }
 
+/// The state of a language's main server, for the top bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Health {
+    Running,
+    Starting,
+    /// None installed (or none that runs).
+    Missing,
+    /// Found, but it would not start.
+    Failed,
+}
+
+/// Why a server is not running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// No working program found.
+    Missing,
+    /// Found, but it would not start: why.
+    Broken(String),
+}
+
+/// A language's main server by name, for messages: "Rust", "Python".
+pub fn server_label(lang: &'static str) -> &'static str {
+    registry().main(lang).map_or(lang, |def| def.label)
+}
+
+/// Linters only report problems; their absence is not worth a message.
+pub fn is_linter(key: &str) -> bool {
+    registry().server(key).is_some_and(|def| def.linter)
+}
+
+/// `lang`'s main server's key.
+fn main_key(lang: &str) -> Option<&'static str> {
+    registry().main(lang).map(|def| def.key)
+}
+
 #[derive(Default)]
 pub struct Hub {
     clients: HashMap<&'static str, Server>,
@@ -168,16 +209,7 @@ pub struct Hub {
     /// top bar: the keys only say which language a server is for.
     names: HashMap<&'static str, String>,
     starting: HashSet<&'static str>,
-    failed: HashMap<&'static str, String>,
-}
-
-/// The main server's key: TypeScript and JavaScript share one server.
-fn server_key(lang: &str) -> &'static str {
-    match lang {
-        "python" => "python",
-        "rust" => "rust",
-        _ => "ts",
-    }
+    failed: HashMap<&'static str, Failure>,
 }
 
 /// The project's Python environment, the first of:
@@ -257,113 +289,112 @@ fn program_name(spec: &LspSpec) -> String {
     }
 }
 
-/// No server for `lang` is installed: which to install, and how.
-fn not_found(lang: &str) -> String {
-    match server_key(lang) {
-        "python" => "No Python language server found, in the project's venv or on PATH. \
-             Install ty: `uv add --dev ty` in the project, or `uv tool install ty` \
-             (basedpyright, pyright and pylsp work too)"
-            .into(),
-        "rust" => "No Rust language server found. Install rust-analyzer: \
-             `rustup component add rust-analyzer`"
-            .into(),
-        _ => "No TypeScript language server found. Install TypeScript 7 \
-             (`npm install -D typescript@7`) or typescript-language-server"
-            .into(),
-    }
-}
-
-/// Every server for a language: the main one first, then linters.
-fn server_keys(lang: &str) -> &'static [&'static str] {
-    match server_key(lang) {
-        // ruff alongside unless the settings turn it off.
-        "python" if crate::settings::get().python.ruff => &["python", "ruff"],
-        "python" => &["python"],
-        "rust" => &["rust"],
-        _ => &["ts"],
-    }
-}
-
-/// Linters only report problems; their absence is not worth a message.
-pub fn is_linter(key: &str) -> bool {
-    key == "ruff"
-}
-
 /// The first installed server for a key.
 fn spec_for(key: &str, root: &Path) -> Option<LspSpec> {
-    // TypeScript 7 (the native rewrite) has its own server: `tsc --lsp`.
-    if key == "ts"
-        && let Some(tsc) = native_tsc(root)
-    {
-        let langs = [
-            "typescript",
-            "typescriptreact",
-            "javascript",
-            "javascriptreact",
-        ];
-        return Some(LspSpec::new(
-            tsc.display().to_string(),
-            vec!["--lsp".into(), "--stdio".into()],
-            langs.iter().map(|lang| (*lang).to_string()).collect(),
-        ));
+    let def = registry().server(key)?;
+    let langs: Vec<String> = def.languages().iter().map(ToString::to_string).collect();
+    match &def.resolver {
+        Resolver::TypeScript => typescript_spec(root, langs),
+        Resolver::Python => {
+            // The preferred Python server (ty unless the settings say
+            // otherwise), then the others in the usual order.
+            let candidates: Vec<_> = crate::settings::get()
+                .python
+                .server
+                .order()
+                .into_iter()
+                .map(crate::settings::PythonServer::command)
+                .collect();
+            first_installed(&candidates, project_venv(root).as_deref(), &langs)
+        }
+        Resolver::Ruff => first_installed(
+            &[("ruff", &["server"])],
+            project_venv(root).as_deref(),
+            &langs,
+        ),
+        Resolver::Command {
+            command,
+            args,
+            init_options,
+        } => {
+            let program = find_program(command)?;
+            let probed = Path::new(command)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| PROBED.contains(&name));
+            if probed && !runs(Path::new(&program)) {
+                crate::debug_log(&format!("{program} is installed but does not run; skipped"));
+                return None;
+            }
+            Some(
+                LspSpec::new(program, args.clone(), langs)
+                    .with_initialization_options(init_options.clone()),
+            )
+        }
     }
-    // The preferred Python server (ty unless the settings say otherwise),
-    // then the others in the usual order.
-    let python: Vec<(&str, &[&str], &[&str])> = crate::settings::get()
-        .python
-        .server
-        .order()
-        .into_iter()
-        .map(|server| {
-            let (cmd, args) = server.command();
-            (cmd, args, &["python"][..])
-        })
-        .collect();
-    let candidates: &[(&str, &[&str], &[&str])] = match key {
-        "ruff" => &[("ruff", &["server"], &["python"])],
-        "python" => &python,
-        "rust" => &[("rust-analyzer", &[], &["rust"])],
-        _ => &[(
-            "typescript-language-server",
-            &["--stdio"],
-            &[
-                "typescript",
-                "typescriptreact",
-                "javascript",
-                "javascriptreact",
-            ],
-        )],
-    };
-    // Python servers run in the project's environment: one installed there
-    // (`uv add --dev ty`) wins over one on PATH, and either way the server
-    // gets that environment, so it resolves the project's imports.
-    let venv = matches!(key, "python" | "ruff")
-        .then(|| project_venv(root))
-        .flatten();
-    let spec = candidates.iter().find_map(|(cmd, args, langs)| {
+}
+
+/// A configured command as a program to run: a path (`~/` is the home
+/// directory) if it exists, a name if it is on PATH.
+fn find_program(command: &str) -> Option<String> {
+    if command.contains('/') {
+        let path = match command.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir()?.join(rest),
+            None => PathBuf::from(command),
+        };
+        return path.is_file().then(|| path.display().to_string());
+    }
+    on_path(command).then(|| command.to_string())
+}
+
+/// The first of `candidates` that is installed and runs. With a `venv` (the
+/// Python servers) one installed there (`uv add --dev ty`) wins over one on
+/// PATH, and either way the server gets that environment, so it resolves
+/// the project's imports.
+fn first_installed(
+    candidates: &[(&str, &[&str])],
+    venv: Option<&Path>,
+    langs: &[String],
+) -> Option<LspSpec> {
+    candidates.iter().find_map(|(cmd, args)| {
         let program = venv
-            .as_ref()
             .map(|venv| venv.join("bin").join(cmd))
             .filter(|path| path.is_file())
             .map(|path| path.display().to_string())
             .or_else(|| on_path(cmd).then(|| (*cmd).to_string()))?;
+        if PROBED.contains(cmd) && !runs(Path::new(&program)) {
+            crate::debug_log(&format!("{program} is installed but does not run; skipped"));
+            return None;
+        }
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-        let langs = langs.iter().map(|lang| (*lang).to_string()).collect();
-        Some(match &venv {
-            Some(venv) => in_venv(venv, &program, args, langs),
-            None => LspSpec::new(program, args, langs),
+        Some(match venv {
+            Some(venv) => in_venv(venv, &program, args, langs.to_vec()),
+            None => LspSpec::new(program, args, langs.to_vec()),
         })
-    })?;
-    if spec.command == "typescript-language-server" {
-        // It needs TypeScript itself, and only looks in the project's
-        // node_modules. Projects without one (own bundler, no package.json)
-        // use a global install, which it must be pointed at.
-        let tsserver = find_tsserver(root);
-        return Some(spec.with_initialization_options(
-            tsserver.map(|path| serde_json::json!({ "tsserver": { "path": path } })),
+    })
+}
+
+/// TypeScript 7's own server (`tsc --lsp`), else typescript-language-server.
+fn typescript_spec(root: &Path, langs: Vec<String>) -> Option<LspSpec> {
+    if let Some(tsc) = native_tsc(root) {
+        return Some(LspSpec::new(
+            tsc.display().to_string(),
+            vec!["--lsp".into(), "--stdio".into()],
+            langs,
         ));
     }
-    Some(spec)
+    let spec = first_installed(
+        &[("typescript-language-server", &["--stdio"])],
+        None,
+        &langs,
+    )?;
+    // It needs TypeScript itself, and only looks in the project's
+    // node_modules. Projects without one (own bundler, no package.json) use a
+    // global install, which it must be pointed at.
+    let tsserver = find_tsserver(root);
+    Some(spec.with_initialization_options(
+        tsserver.map(|path| serde_json::json!({ "tsserver": { "path": path } })),
+    ))
 }
 
 /// A `tsc` of version 7 or later (which serves LSP): the project's own, else
@@ -392,6 +423,31 @@ fn native_tsc(root: &Path) -> Option<PathBuf> {
 /// What `<program> --version` prints, or `None` if it fails or takes longer
 /// than a few seconds (it is then killed).
 fn version_output(program: &Path) -> Option<String> {
+    run_version(program)?.1
+}
+
+/// Servers that answer `--version`, so a broken install can be told apart
+/// from a working one before it is started. rustup puts a `rust-analyzer`
+/// in `~/.cargo/bin` even without the component, and a venv's tools stop
+/// working when its Python goes away; both are on PATH but do not run.
+/// (pyright's servers are left out: their `--version` is not relied on.)
+const PROBED: &[&str] = &[
+    "rust-analyzer",
+    "ty",
+    "ruff",
+    "pylsp",
+    "typescript-language-server",
+];
+
+/// Whether `<program> --version` exits successfully within a few seconds.
+fn runs(program: &Path) -> bool {
+    run_version(program).is_some_and(|(success, _)| success)
+}
+
+/// Run `<program> --version`: whether it exited successfully, and what it
+/// printed (`None` if that was not read within a few seconds; it is then
+/// killed). `None` overall if it cannot be started.
+fn run_version(program: &Path) -> Option<(bool, Option<String>)> {
     use std::io::Read;
     use std::process::Command;
     use std::process::Stdio;
@@ -412,9 +468,11 @@ fn version_output(program: &Path) -> Option<String> {
         let _ = done.send(read);
     });
     let read = output.recv_timeout(std::time::Duration::from_secs(5));
+    // Killing one that already exited does nothing; `wait` then gives its
+    // own status. One still running at the deadline counts as failed.
     let _ = child.kill();
-    let _ = child.wait();
-    read.ok()?.ok()
+    let success = child.wait().is_ok_and(|status| status.success());
+    Some((success, read.ok().and_then(Result::ok)))
 }
 
 /// `typescript/lib/tsserver.js`: the project's own, else a global install
@@ -438,28 +496,46 @@ fn find_tsserver(root: &Path) -> Option<PathBuf> {
 impl Hub {
     /// The main server for `lang`.
     pub fn client(&self, lang: &str) -> Option<Server> {
-        self.clients.get(server_key(lang)).cloned()
+        self.clients.get(main_key(lang)?).cloned()
     }
 
     /// Every running server for `lang` (main and linters), with its key.
     pub fn running(&self, lang: &str) -> Vec<(&'static str, Server)> {
-        server_keys(lang)
-            .iter()
-            .filter_map(|key| Some((*key, self.clients.get(key)?.clone())))
+        registry()
+            .keys(lang)
+            .into_iter()
+            .filter_map(|key| Some((key, self.clients.get(key)?.clone())))
             .collect()
     }
 
-    /// Any running main server, for workspace-wide queries with no file open.
+    /// A running main server, for workspace-wide queries with no file open:
+    /// the first in the registry's order, so always the same one.
     pub fn any_client(&self) -> Option<Server> {
-        self.clients
-            .iter()
-            .find(|(key, _)| !is_linter(key))
-            .map(|(_, client)| client.clone())
+        registry()
+            .mains()
+            .find_map(|def| self.clients.get(def.key).cloned())
+    }
+
+    /// How `lang`'s main server is doing; `None` before it is first looked for
+    /// (or when no server serves `lang`).
+    pub fn health(&self, lang: &str) -> Option<Health> {
+        let key = main_key(lang)?;
+        if self.clients.contains_key(key) {
+            Some(Health::Running)
+        } else if self.starting.contains(key) {
+            Some(Health::Starting)
+        } else {
+            self.failed.get(key).map(|failure| match failure {
+                Failure::Missing => Health::Missing,
+                Failure::Broken(_) => Health::Failed,
+            })
+        }
     }
 
     pub fn status(&self) -> String {
-        // Running servers by program; starting and failed ones by language,
-        // as which program it will be is not known yet.
+        // Running servers by program; starting and failed ones by key, as
+        // which program it will be is not known yet. A missing linter is
+        // not worth mentioning.
         let mut parts: Vec<String> = self
             .clients
             .keys()
@@ -474,8 +550,11 @@ impl Hub {
         parts.extend(
             self.failed
                 .iter()
-                .filter(|(_, msg)| !msg.is_empty())
-                .map(|(key, _)| format!("{key} failed")),
+                .filter(|(key, failure)| **failure != Failure::Missing || !is_linter(key))
+                .map(|(key, failure)| match failure {
+                    Failure::Missing => format!("{key} missing"),
+                    Failure::Broken(_) => format!("{key} failed"),
+                }),
         );
         parts.sort();
         parts.join(" ")
@@ -486,35 +565,34 @@ impl Hub {
     /// works without a restart (a failure is otherwise remembered, so it is
     /// not looked up on every key).
     pub fn unavailable(&mut self, lang: &str, root: &Path, tx: &UnboundedSender<Event>) -> String {
-        let key = server_key(lang);
+        let Some(key) = main_key(lang) else {
+            return format!("No language server serves {lang}");
+        };
         if self.starting.contains(key) {
             return format!("The {lang} language server is still starting");
         }
-        let reason = self.failed.remove(key);
-        for key in server_keys(lang) {
+        let reason = self
+            .failed
+            .remove(key)
+            .and_then(|failure| message(key, &failure));
+        for key in registry().keys(lang) {
             self.failed.remove(key);
         }
         self.ensure(lang, root, tx);
         match reason {
-            Some(reason) if !reason.is_empty() => format!("{reason}. Looking again..."),
-            _ => format!("Starting the {lang} language server..."),
+            Some(reason) => format!("{reason}. Looking again..."),
+            None => format!("Starting the {lang} language server..."),
         }
     }
 
     /// Start the servers for `lang` that are not running or starting yet.
     pub fn ensure(&mut self, lang: &str, root: &Path, tx: &UnboundedSender<Event>) {
-        for key in server_keys(lang) {
-            self.ensure_key(key, lang, root, tx);
+        for key in registry().keys(lang) {
+            self.ensure_key(key, root, tx);
         }
     }
 
-    fn ensure_key(
-        &mut self,
-        key: &'static str,
-        lang: &str,
-        root: &Path,
-        tx: &UnboundedSender<Event>,
-    ) {
+    fn ensure_key(&mut self, key: &'static str, root: &Path, tx: &UnboundedSender<Event>) {
         if self.clients.contains_key(key)
             || self.starting.contains(key)
             || self.failed.contains_key(key)
@@ -524,7 +602,6 @@ impl Hub {
         self.starting.insert(key);
         let root = root.to_path_buf();
         let tx = tx.clone();
-        let lang = lang.to_string();
         tokio::spawn(async move {
             // Finding the server runs programs (`tsc --version`), so it stays
             // off the app loop.
@@ -533,14 +610,8 @@ impl Hub {
                 tokio::task::spawn_blocking(move || spec_for(key, &root)).await
             };
             let Ok(Some(spec)) = found else {
-                // A missing linter is not worth a message (an empty one is
-                // not shown); it is remembered, so it is not looked up again.
-                let msg = if is_linter(key) {
-                    String::new()
-                } else {
-                    not_found(&lang)
-                };
-                let _ = tx.send(Event::LspFailed(key, msg));
+                // Remembered, so it is not looked up again.
+                let _ = tx.send(Event::LspFailed(key, Failure::Missing));
                 return;
             };
             let name = program_name(&spec);
@@ -578,7 +649,8 @@ impl Hub {
                     let _ = tx.send(Event::LspReady(key, program, client));
                 }
                 Err(err) => {
-                    let _ = tx.send(Event::LspFailed(key, format!("{name}: {err}")));
+                    let failure = Failure::Broken(format!("{name}: {err}"));
+                    let _ = tx.send(Event::LspFailed(key, failure));
                 }
             }
         });
@@ -593,13 +665,29 @@ impl Hub {
         server
     }
 
-    pub fn failed(&mut self, key: &'static str, msg: String) {
+    /// Take a server that could not start; returns what to tell the user,
+    /// if anything.
+    pub fn failed(&mut self, key: &'static str, failure: Failure) -> Option<String> {
         self.starting.remove(key);
-        self.failed.insert(key, msg);
+        let shown = message(key, &failure);
+        self.failed.insert(key, failure);
+        shown
     }
 
     pub fn is_key(lang: &str, key: &str) -> bool {
-        server_keys(lang).contains(&key)
+        registry().keys(lang).contains(&key)
+    }
+}
+
+/// What to say about a failed server: how to install a missing one (a
+/// missing linter is not worth a message), why a broken one stopped.
+fn message(key: &str, failure: &Failure) -> Option<String> {
+    match failure {
+        Failure::Missing => registry()
+            .server(key)
+            .filter(|def| !def.linter)
+            .map(|def| def.missing.clone()),
+        Failure::Broken(why) => Some(why.clone()),
     }
 }
 

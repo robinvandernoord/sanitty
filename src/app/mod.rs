@@ -278,11 +278,10 @@ impl App {
             }
             Event::Status(text) => self.status = text,
             Event::LspReady(key, program, client) => self.on_lsp_ready(key, program, client),
-            Event::LspFailed(key, msg) => {
-                if !msg.is_empty() {
-                    self.status.clone_from(&msg);
+            Event::LspFailed(key, failure) => {
+                if let Some(msg) = self.lsp.failed(key, failure) {
+                    self.status = msg;
                 }
-                self.lsp.failed(key, msg);
             }
             Event::Diagnostics(key, path, version, related, diags) => {
                 self.on_diagnostics(key, path, (version, related), diags);

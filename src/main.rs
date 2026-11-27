@@ -52,7 +52,7 @@ pub enum Event {
     Status(String),
     /// A language server started: its key, the program it is, the client.
     LspReady(&'static str, String, Arc<LspClient>),
-    LspFailed(&'static str, String),
+    LspFailed(&'static str, crate::lsp::Failure),
     /// Problems for a file from one server (its key), replacing that server's last report.
     /// The document version it describes, when known, so an older report
     /// cannot replace a newer one.
